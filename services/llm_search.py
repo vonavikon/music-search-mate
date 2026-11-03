@@ -160,6 +160,7 @@ class SearchOut:
     reference: dict = field(default_factory=dict)
     target: dict = field(default_factory=dict)
     block: str = ""  # destructive-query category from LLM#1 ('' = clean)
+    degraded: bool = False  # LLM-less fallback: raw YouTube order, no extract/rank
     trace: object = field(default=None, repr=False)  # SearchTrace: decision/final trace record
 
 
@@ -180,7 +181,10 @@ class BothubClient:
         # (from_source, resolve failure). Empty = layer disabled.
         self._sonar_model = (sonar_model or "").strip()
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0))
-        self._breaker = CircuitBreaker("bothub", threshold=3, cooldown=60.0)
+        # threshold=2 (03.11): with the 5xx no-retry above one failed call = one
+        # failure; the second failing call opens the circuit, so an outage costs
+        # ~2×20s total instead of 3×20s per query for every query.
+        self._breaker = CircuitBreaker("bothub", threshold=2, cooldown=60.0)
         # Latest usage from bothub (tokens) — the driver of LLM cost.
         # Money = tokens × price per 1M (see bothub pricing); the tokens
         # themselves are more stable than prices.
@@ -263,6 +267,12 @@ class BothubClient:
                 if e.response.status_code in (401, 403):
                     self._breaker.record_failure()
                     break  # don't retry auth errors
+                if e.response.status_code >= 500:
+                    # 03.11 prod case: a bothub 503 wave — each retry waited ~20s
+                    # and one query burned 3×20s. A 5xx means the gateway itself
+                    # is down: fail this call now, let the circuit decide for the next.
+                    self._breaker.record_failure()
+                    break
             except Exception as e:
                 last = f"{type(e).__name__}: {str(e)[:120]}"
             self._breaker.record_failure()
@@ -1088,7 +1098,7 @@ async def _fallback_raw_search(description: str, on_progress, t_start: float, tr
               len(raw), len(cands), time.perf_counter() - t_start)
     return SearchOut(intent=None, signals={}, queries=[description], assoc=[],
                      candidates=cands, best_index=0 if cands else -1,
-                     confidence="low", intro="", trace=trace)
+                     confidence="low", intro="", trace=trace, degraded=True)
 
 
 async def search_candidates(

@@ -1189,3 +1189,119 @@ def test_start_mig_nova_payload():
     assert _mig_nova_payload(SimpleNamespace(args=["mig_nova"])) is True
     assert _mig_nova_payload(SimpleNamespace(args=["mig_msb"])) is False
     assert _mig_nova_payload(SimpleNamespace()) is False  # no args
+
+
+def test_greeting_both_languages_bound():
+    """03.11 prod crash: EN /start died with UnboundLocalError - head was bound
+    only in the RU branch of _greeting. Both languages must return a pool hello
+    followed by the full body text."""
+    from bot import handler as h
+    for lang in ("en", "ru"):
+        g = h._greeting(lang)
+        assert g.split("\n\n", 1)[0] in h._GREETING_HELLOS
+        assert "Music Search Mate" in g
+
+
+@pytest.mark.asyncio
+async def test_slow_mode_wait_and_retry_once():
+    """03.11: a group slow mode rejects a NEW message with RetryAfter = the rest
+    of the window. The helper announces the wait (an edit, not restricted),
+    waits, retries ONCE and returns the sent message."""
+    from bot.handler import _send_with_slow_mode
+    from telegram.error import RetryAfter
+
+    calls = []
+    sent = object()
+
+    async def send_call():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RetryAfter(20)
+        return sent
+
+    class _St:
+        async def edit_text(self, *a, **k):
+            pass
+
+    with patch("bot.handler._t", new=AsyncMock(return_value="wait…")):
+        with patch("bot.handler.asyncio.sleep", new=AsyncMock()) as msleep:
+            res = await _send_with_slow_mode(send_call, _St(), 1)
+
+    assert res is sent
+    assert len(calls) == 2
+    assert msleep.await_count == 1
+    assert 20 <= msleep.await_args.args[0] <= 23  # wait + small epsilon
+
+
+@pytest.mark.asyncio
+async def test_slow_mode_refused_after_second_rejection():
+    """A second RetryAfter raises _SlowModeRefused (the honest slow-mode text
+    has landed in the status) — the caller's candidate loop must stop."""
+    from bot.handler import _send_with_slow_mode, _SlowModeRefused
+    from telegram.error import RetryAfter
+
+    calls = []
+
+    async def send_call():
+        calls.append(1)
+        raise RetryAfter(15)
+
+    class _St:
+        async def edit_text(self, *a, **k):
+            pass
+
+    with patch("bot.handler._t", new=AsyncMock(return_value="slow")):
+        with patch("bot.handler.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(_SlowModeRefused):
+                await _send_with_slow_mode(send_call, _St(), 1)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_slow_mode_refused_on_long_wait():
+    """A wait over the cap (a very slow group) refuses on the FIRST rejection —
+    no multi-minute hangs."""
+    from bot.handler import _send_with_slow_mode, _SlowModeRefused, _SLOW_MODE_MAX_WAIT
+    from telegram.error import RetryAfter
+
+    calls = []
+
+    async def send_call():
+        calls.append(1)
+        raise RetryAfter(_SLOW_MODE_MAX_WAIT + 5)
+
+    class _St:
+        async def edit_text(self, *a, **k):
+            pass
+
+    with patch("bot.handler._t", new=AsyncMock(return_value="slow")):
+        with pytest.raises(_SlowModeRefused):
+            await _send_with_slow_mode(send_call, _St(), 1)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_slow_mode_refusal_notice_flag():
+    """P1 from review: when the status cannot carry the honest text (None or
+    not editable), the exception carries notice_shown=False so the caller
+    replies via the callback message instead of staying silent."""
+    from bot.handler import _send_with_slow_mode, _SlowModeRefused
+    from telegram.error import RetryAfter
+
+    async def send_call():
+        raise RetryAfter(15)
+
+    class _St:
+        async def edit_text(self, *a, **k):
+            pass
+
+    with patch("bot.handler._t", new=AsyncMock(return_value="slow")):
+        with patch("bot.handler.asyncio.sleep", new=AsyncMock()):
+            # status=None -> notice never shown
+            with pytest.raises(_SlowModeRefused) as ei:
+                await _send_with_slow_mode(send_call, None, 1)
+            assert getattr(ei.value, "notice_shown", None) is False
+            # editable status -> notice shown
+            with pytest.raises(_SlowModeRefused) as ei:
+                await _send_with_slow_mode(send_call, _St(), 1)
+            assert getattr(ei.value, "notice_shown", None) is True

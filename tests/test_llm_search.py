@@ -1224,3 +1224,46 @@ class TestDestructiveModeration:
                 out = await search_candidates("обычный запрос", bothub_client)
         assert out.block == ""
         assert len(out.candidates) == 3
+
+
+class _Resp503:
+    """A minimal httpx 503 response for the real chat_json (no network)."""
+
+    def __init__(self):
+        import httpx
+        self._req = httpx.Request("POST", "http://bothub.test/chat/completions")
+        self._resp = httpx.Response(503, request=self._req)
+
+    def raise_for_status(self):
+        import httpx
+        raise httpx.HTTPStatusError("Service Unavailable",
+                                    request=self._req, response=self._resp)
+
+
+@pytest.mark.asyncio
+async def test_bothub_503_single_attempt(bothub_client):
+    """03.11 prod case: a bothub 503 wave — one chat_json call must make exactly
+    ONE attempt (no 3x20s retries on a downed gateway) and record one breaker
+    failure. Parse-failure retries stay (test_bothub_retry_on_parse_failure)."""
+    assert bothub_client._breaker.threshold == 2  # opens on the 2nd failing call
+    with patch.object(bothub_client._http, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = _Resp503()
+        res = await bothub_client.chat_json("system", "user")
+    assert res is None
+    assert mock_post.call_count == 1
+    assert bothub_client._breaker._failures == 1
+    bothub_client._breaker.record_success()  # don't leak breaker state into other tests
+
+
+@pytest.mark.asyncio
+async def test_fallback_sets_degraded_flag(bothub_client):
+    """The LLM-less fallback marks SearchOut.degraded so the handler shows the
+    honest notice + preview instead of auto-downloading the raw YouTube top
+    (03.11 prod case: a vibe query auto-sent a title-similar track)."""
+    with patch.object(bothub_client, "chat_json", return_value=None):
+        with patch("services.llm_search.search_metadata") as mock_yt:
+            mock_yt.return_value = _yt_entries()
+            out = await search_candidates("что угодно", bothub_client)
+    assert out.degraded is True
+    assert out.intent is None
+    assert len(out.candidates) == 3

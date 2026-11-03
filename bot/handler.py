@@ -27,6 +27,7 @@ from uuid import uuid4
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter
 from telegram.ext import ContextTypes
 
 import random
@@ -124,6 +125,12 @@ _T = {
                        "en": "Couldn't read the link. Trying to understand the description…"},
     "dl_none": {"ru": "Не смог скачать ни один из вариантов. Попробуй позже или кинь ссылку.",
                 "en": "Couldn't download any of the variants. Try later or send a link."},
+    "degraded_notice": {"ru": "Нейросеть что-то недоступна, пока пойду более простым путём.",
+                        "en": "The AI is unavailable for a moment, going the simple way for now."},
+    "slow_wait": {"ru": "Telegram просит подождать {sec} с из-за медленного режима группы, файл едет…",
+                  "en": "Telegram asks to wait {sec}s: the group has slow mode on, the file is on its way…"},
+    "slow_mode_group": {"ru": "В группе включён медленный режим, Telegram не даёт прислать файл. Сделайте бота админом группы или ослабьте режим.",
+                        "en": "This group has slow mode on and Telegram won't let me send the file. Promote the bot to admin or relax the mode."},
     "dl_tg_reject": {"ru": "Трек скачался, но Telegram не принял файл. Пробую другой вариант…",
                      "en": "The track downloaded, but Telegram rejected the file. Trying another variant…"},
     "dl_track_fail": {"ru": "Не смог скачать {title}. Попробуй другую ссылку.",
@@ -424,6 +431,12 @@ _GREETING_HELLOS = [
 ]
 
 def _greeting(lang: str) -> str:
+    # Random greeting word from the shared pool + the owner's fixed body text
+    # (the language only picks the body; the picture goes in the next message).
+    # Crash fix 03.11: head used to be assigned only in the RU branch below —
+    # an EN /start died with UnboundLocalError (3x in prod logs).
+    import random as _r
+    head = _r.choice(_GREETING_HELLOS)
     if lang == "en":
         return (head + "\n\n<b>Music Search Mate will find a track from a "
                 "scene description</b>, or pick one in the same style but, "
@@ -434,11 +447,6 @@ def _greeting(lang: str) -> str:
                 "• 'similar to Moody Blues — Nights in White Satin'\n\n"
                 "<b>Or just send a link</b> from YouTube, SoundCloud, "
                 "and I'll download it.")
-    # Random greeting word in the chosen language + the owner's fixed text;
-    # the picture goes in the next message
-    import random as _r
-    hellos = _GREETING_HELLOS
-    head = _r.choice(hellos)
     return (head + "\n\n<b>Music Search Mate найдёт трек по описанию сцены, "
             "где он играл</b>, или подберёт в том же стиле, но, например, "
             "на другом языке.\n\n"
@@ -587,6 +595,62 @@ def _progress_bar(pct: float) -> str:
     """Download animation with a fill bar."""
     filled = max(0, min(10, int(pct // 10)))
     return "\u2588" * filled + "\u2591" * (10 - filled)
+
+
+# Groups with slow mode: a bot-member's NEW message inside the window is
+# rejected with RetryAfter = the rest of the window (message EDITS are not
+# restricted). Prod case 03.11: two candidates burned against a 1/min group,
+# the user got "Не смог скачать ни один из вариантов" for a healthy track.
+_SLOW_MODE_MAX_WAIT = 45  # sec; a longer wait means a very slow group — refuse honestly
+
+
+class _SlowModeRefused(Exception):
+    """Slow mode rejected the send twice (or the wait is over the cap). The
+    status already carries the honest explanation; retrying other candidates
+    against the same window is pointless, so the caller's loop stops.
+    .notice_shown tells the caller whether the honest text actually landed
+    (the status may be None or not editable — then the caller shows it)."""
+
+
+def _refuse_slow_mode(notice_shown: bool) -> _SlowModeRefused:
+    e = _SlowModeRefused()
+    e.notice_shown = notice_shown
+    return e
+
+
+async def _send_with_slow_mode(send_call, status, user_id):
+    """Run a Telegram send that may hit a group slow mode. One wait-and-retry
+    inside _SLOW_MODE_MAX_WAIT (the wait is announced in the status — an edit,
+    which slow mode does not restrict); a repeat or too-long rejection raises
+    _SlowModeRefused after the honest slow-mode text lands in the status."""
+    for attempt in (1, 2):
+        try:
+            return await send_call()
+        except RetryAfter as e:
+            wait_s = getattr(e, "retry_after", 0) or 0
+            # PTB deprecation in flight: retry_after becomes datetime.timedelta
+            wait_s = wait_s.total_seconds() if hasattr(wait_s, "total_seconds") else float(wait_s)
+            if attempt == 1 and wait_s <= _SLOW_MODE_MAX_WAIT:
+                log.info("send hit RetryAfter %.1fs (group slow mode?) — waiting once, chat=%s",
+                         wait_s, getattr(status, "chat", None) and status.chat.id)
+                if status:
+                    try:
+                        await status.edit_text(await _t(user_id, "slow_wait", sec=int(wait_s) + 1))
+                    except Exception:
+                        pass
+                await asyncio.sleep(wait_s + 1.5)
+                continue
+            log.warning("send refused by slow mode (wait %.1fs, attempt %d) — giving up",
+                        wait_s, attempt)
+            notice_shown = False
+            if status:
+                try:
+                    await status.edit_text(await _t(user_id, "slow_mode_group"))
+                    notice_shown = True
+                except Exception:
+                    pass
+            raise _refuse_slow_mode(notice_shown)
+    raise _refuse_slow_mode(False)  # safeguard: the loop always returns or raises
 
 
 # Groups: privacy mode OFF hands the bot EVERY group message — without a gate
@@ -1089,9 +1153,26 @@ async def _finish_search(update, context, status, out, desc, user):
             trace.finish(output={"decision": "clarify", "question": out.clarify_question})
         return
 
-    log.info("decide user=%s intent=%s score=%.2f amb=%s tid=%s",
+    log.info("decide user=%s intent=%s score=%.2f amb=%s degraded=%s tid=%s",
              user.id, out.intent, best.match_score if best else 0.0, ambiguous,
+             bool(getattr(out, "degraded", False)),
              trace.trace_id[:8] if trace else "-")
+    # LLM-less fallback (bothub down): candidates are in raw YouTube order with
+    # no verdict — auto-downloading the top was a prod miss (03.11: a vibe query
+    # auto-sent a title-similar track). Instead: the owner's honest notice +
+    # a preview list, the miss chain works from the chosen card as usual.
+    if getattr(out, "degraded", False):
+        if trace:
+            trace.finish(output={"decision": "degraded_preview",
+                                 "best": best.title if best else None})
+        if best:
+            text, markup = _render_preview(query_id, out.candidates,
+                                           intro=await _t(user.id, "degraded_notice"),
+                                           lang=await _lang_of(user.id))
+            await status.edit_text(text, reply_markup=markup)
+        else:
+            await status.edit_text(await _t(user.id, "nothing_found"))
+        return
     # Owner decision 2026-11-01: ONE result delivered immediately with the track
     # downloaded; the send is always "card (cover + facts) -> tagged audio".
     # Preview/carousel was removed from the main path: quality is worked through via
@@ -1112,9 +1193,12 @@ async def _finish_search(update, context, status, out, desc, user):
             if idx >= len(out.candidates):
                 break
             track = out.candidates[idx]
-            ok = await _send_track(update, context, status, media, query_id, idx,
-                                   out.candidates, track, out.confidence,
-                                   out.verdict if idx == out.best_index else track.rationale)
+            try:
+                ok = await _send_track(update, context, status, media, query_id, idx,
+                                       out.candidates, track, out.confidence,
+                                       out.verdict if idx == out.best_index else track.rationale)
+            except _SlowModeRefused:
+                return  # the honest slow-mode text is already in the status
             if ok:
                 return
         # all attempts failed
@@ -1155,9 +1239,12 @@ async def _try_sim_from_pool(update, context, user, status, media,
         nxt_rank = store["candidates"].index(nxt)
     except ValueError:
         nxt_rank = 0
-    ok = await _send_track(update, context, status, media, last_qid, nxt_rank,
-                           store["candidates"], nxt, store.get("confidence", "low"),
-                           nxt.rationale or "Из тех же поисков, следующий по похожести.")
+    try:
+        ok = await _send_track(update, context, status, media, last_qid, nxt_rank,
+                               store["candidates"], nxt, store.get("confidence", "low"),
+                               nxt.rationale or "Из тех же поисков, следующий по похожести.")
+    except _SlowModeRefused:
+        return True  # handled: the honest slow-mode text is in the status; no re-search
     if ok:
         pass  # the cache path carries no Langfuse trace: with no LLM stages there is nothing to trace
     return ok
@@ -1422,19 +1509,27 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
             if _aw:
                 try:
                     await update.effective_chat.send_photo(photo=_aw)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("cover photo (cache url) not sent: %s", str(e)[:80])
             try:
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=cached["file_id"],
-                    caption=_caption(cached_meta, track, confidence, verdict),
-                    parse_mode=ParseMode.HTML, reply_markup=kb,
-                    performer=(cached_meta.artist or "")[:64],
-                    title=(cached_meta.track or "")[:64],
-                )
+                async def _cached_send():
+                    return await context.bot.send_audio(
+                        chat_id=update.effective_chat.id,
+                        audio=cached["file_id"],
+                        caption=_caption(cached_meta, track, confidence, verdict),
+                        parse_mode=ParseMode.HTML, reply_markup=kb,
+                        performer=(cached_meta.artist or "")[:64],
+                        title=(cached_meta.track or "")[:64],
+                    )
+                await _send_with_slow_mode(_cached_send, status,
+                                           update.effective_user.id)
                 if status:
                     await status.delete()
+            except _SlowModeRefused:
+                # slow mode hit the cache path too — a re-download would face
+                # the same window; propagate (the function-level handler cancels
+                # the indicator, the caller stops the loop honestly)
+                raise
             except Exception:
                 # file_id went stale / network — fall through to the regular download below
                 log.exception("send_audio cached failed (fallback to download): %s", track.video_id)
@@ -1550,15 +1645,17 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                 if _aw_url:
                     try:
                         await update.effective_chat.send_photo(photo=_aw_url)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # not fatal (the audio goes anyway), but a silent swallow
+                        # hid group slow-mode rejections (03.11) — keep a trace
+                        log.debug("cover photo (url) not sent: %s", str(e)[:80])
                 elif meta and meta.artwork_path and Path(meta.artwork_path).exists():
                     try:
                         with open(meta.artwork_path, "rb") as _cf:
                             await update.effective_chat.send_photo(
                                 photo=InputFile(_cf, filename="cover.jpg"))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("cover photo (file) not sent: %s", str(e)[:80])
 
                 # Thumbnail = album cover (the owner confirmed Telegram
                 # shows it in the player). The fd is closed in finally (it leaked
@@ -1589,14 +1686,28 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                                     pass
                             if Path(_tp_name).exists() and Path(_tp_name).stat().st_size > 0:
                                 _thumb_f = open(_tp_name, "rb")
-                    sent = await context.bot.send_audio(
-                        chat_id=update.effective_chat.id,
-                        audio=InputFile(f, filename=_safe_name(track, ext=Path(m4a_path).suffix)),
-                        caption=caption, parse_mode=ParseMode.HTML,
-                        performer=_meta_artist[:64], title=_meta_title[:64],
-                        thumbnail=(InputFile(_thumb_f, filename="cover.jpg") if _thumb_f else None),
-                        reply_markup=kb, read_timeout=120, write_timeout=120, connect_timeout=30,
-                    )
+                    async def _audio_send():
+                        # a fresh InputFile per attempt: a rejected upload may
+                        # leave the file pointer at EOF (a retry would send 0 bytes)
+                        try:
+                            f.seek(0)
+                        except (OSError, ValueError):
+                            pass
+                        if _thumb_f:
+                            try:
+                                _thumb_f.seek(0)
+                            except (OSError, ValueError):
+                                pass
+                        return await context.bot.send_audio(
+                            chat_id=update.effective_chat.id,
+                            audio=InputFile(f, filename=_safe_name(track, ext=Path(m4a_path).suffix)),
+                            caption=caption, parse_mode=ParseMode.HTML,
+                            performer=_meta_artist[:64], title=_meta_title[:64],
+                            thumbnail=(InputFile(_thumb_f, filename="cover.jpg") if _thumb_f else None),
+                            reply_markup=kb, read_timeout=120, write_timeout=120, connect_timeout=30,
+                        )
+                    sent = await _send_with_slow_mode(_audio_send, status,
+                                                      update.effective_user.id)
                     await insert_event(user_id=update.effective_user.id, kind="dl_audio",
                                        query_id=query_id, video_id=track.video_id)
                 finally:
@@ -1631,6 +1742,11 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                     log.exception("cache_file failed %s", track.video_id)
             if status:
                 await status.delete()
+        except _SlowModeRefused:
+            # the status already carries the honest slow-mode text; cycling
+            # through the next candidates against the same window is pointless
+            _ua.cancel()
+            raise
         except Exception:
             # a send failure = a candidate failure: the caller tries the next one
             # (it used to return True here and the fallback silently gave up — review 2026-09-03)
@@ -2120,8 +2236,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 signals=None, queries=[url], candidates=[cand.__dict__],
                 best_video_id=vid, best_title=title, best_score=None, confidence="high")
             await incr_usage(user.id, "urls")
-            await _send_track(update, context, q.message, media_svc, query_id, 0,
-                              [cand], cand, "high", "Лови трек по ссылке.", keyboard="url")
+            try:
+                await _send_track(update, context, q.message, media_svc, query_id, 0,
+                                  [cand], cand, "high", "Лови трек по ссылке.", keyboard="url")
+            except _SlowModeRefused as e:
+                # the helper edits q.message when possible; reply only if it couldn't
+                if not getattr(e, "notice_shown", False):
+                    try:
+                        await q.message.reply_text(await _t(user.id, "slow_mode_group"))
+                    except Exception:
+                        pass
             return
 
         if action == "vid":
@@ -2194,12 +2318,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     fname = _button_label(title, info.get("channel", ""))[:60]
                     fname = re.sub(r'[\\/:*?"<>|]+', "", fname) or "video"
                     with open(path, "rb") as vf:
-                        await context.bot.send_video(
-                            chat_id=update.effective_chat.id,
-                            video=InputFile(vf, filename=f"{fname}.mp4"),
-                            caption=f"🎬 {title[:200]}\n📅 {info.get('upload_date', '?')[:4] or '?'}",
-                            supports_streaming=True,
-                            read_timeout=600, write_timeout=600, connect_timeout=30)
+                        async def _video_send():
+                            # same EOF-guard as the audio path (a fresh attempt
+                            # re-reads the file from the start)
+                            try:
+                                vf.seek(0)
+                            except (OSError, ValueError):
+                                pass
+                            return await context.bot.send_video(
+                                chat_id=update.effective_chat.id,
+                                video=InputFile(vf, filename=f"{fname}.mp4"),
+                                caption=f"🎬 {title[:200]}\n📅 {info.get('upload_date', '?')[:4] or '?'}",
+                                supports_streaming=True,
+                                read_timeout=600, write_timeout=600, connect_timeout=30)
+                        await _send_with_slow_mode(_video_send, vstat,
+                                                   update.effective_user.id)
                     await incr_usage(user.id, "videos")
                     await insert_event(user_id=user.id, kind="dl_video", video_id=vid)
                     try:
@@ -2207,6 +2340,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await incr_usage(user.id, "bytes_sent", _mb)
                     except Exception:  # non-OSError from store too
                         pass
+                except _SlowModeRefused as e:
+                    # vstat carries the text when it exists; when the status
+                    # reply itself was refused (vstat=None, typical in a
+                    # slow-mode group), tell the user via the callback message
+                    if not getattr(e, "notice_shown", False):
+                        try:
+                            await q.message.reply_text(
+                                await _t(update.effective_user.id, "slow_mode_group"))
+                        except Exception:
+                            pass
                 except Exception as e:
                     log.exception("video download failed: %s", str(e)[:100])
                     try:
@@ -2303,8 +2446,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(f"Качаю: {_button_label(track.title, track.channel)}…")
             except Exception:
                 pass
-            ok = await _send_track(update, context, None, media, query_id, rank,
-                                   cands, track, store["confidence"], store.get("verdict", ""))
+            try:
+                ok = await _send_track(update, context, None, media, query_id, rank,
+                                       cands, track, store["confidence"], store.get("verdict", ""))
+            except _SlowModeRefused as e:
+                # status=None on this path — the helper never showed the text
+                if not getattr(e, "notice_shown", False):
+                    try:
+                        await q.message.reply_text(await _t(update.effective_user.id, "slow_mode_group"))
+                    except Exception:
+                        pass
+                return
             if not ok:
                 # a download failure must not burn the choice — restore the preview
                 text, markup = _render_preview(query_id, cands,
@@ -2410,8 +2562,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await _sends_over(update, context, user):
             return
         status = await q.message.reply_text(await _status_text(update.effective_user.id, "st_other"))
-        await _send_track(update, context, status, media, query_id, rank + 1, candidates,
-                          nxt, store["confidence"], nxt.rationale)
+        try:
+            await _send_track(update, context, status, media, query_id, rank + 1, candidates,
+                              nxt, store["confidence"], nxt.rationale)
+        except _SlowModeRefused:
+            return  # the honest slow-mode text is already in the status
 
 
 async def _stats_funnel(user_id: int) -> str:

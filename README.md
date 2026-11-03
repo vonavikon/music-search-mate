@@ -47,7 +47,8 @@ Full quality video: [demo.mp4](assets/demo.mp4)
 - **Track card:** artwork, canonical artist, short bio, "hit / miss" buttons.
 - **Track facts:** the 💡 button fetches one web-grounded fact about the track via Perplexity sonar, cached for 30 days; repeated taps are free.
 - **Caches:** Telegram file_id (a track sent before is re-sent without downloading again), fact cache, similar pools, Last.fm lookups with a TTL.
-- **Groups:** the bot reacts only to @mentions (privacy mode off plus an explicit gate in code); per-user limits apply everywhere.
+- **Groups:** the bot reacts only to @mentions (privacy mode off plus an explicit gate in code); per-user limits apply everywhere. Groups with Telegram slow mode are handled: the bot waits out the window once (up to 45 s, with a status note) and, if Telegram still refuses, tells the admins plainly instead of burning through candidates.
+- **Graceful degradation:** when the LLM gateway is down, the bot says so ("the AI is unavailable for a moment, going the simple way for now") and shows a pick-list of raw search results instead of silently auto-sending whatever the search topped with; one 5xx costs one attempt, not three.
 - **Localization:** RU/EN for errors, statuses, buttons, and the clarifying questions the LLM asks; switch with /lang.
 - **Limits, in pieces not gigabytes:** 20 requests per hour per user, 100 searches a day on the live instance (code default 200, set by env) and 30 videos per day, 2 facts per day (cache hits are free), plus global daily budgets for everyone.
 - **Honest progress:** a percent progress bar (updates roughly every 3% / 1.2 s) and a separate "preparing file" stage while the file is converted, tagged, and uploaded.
