@@ -1305,3 +1305,33 @@ async def test_slow_mode_refusal_notice_flag():
             with pytest.raises(_SlowModeRefused) as ei:
                 await _send_with_slow_mode(send_call, _St(), 1)
             assert getattr(ei.value, "notice_shown", None) is True
+
+
+class TestSplitYtReference:
+    """URL-track references: ad junk must not leak into "похожие на ..."."""
+
+    def test_dior_ad_title(self):
+        from bot.handler import _split_yt_reference
+        # the real 03.11 case: artist + track + a wall of ad junk, en-dash
+        a, t = _split_yt_reference(
+            'Ry Cooder – Dior wild man (Full Official Track) Johnny Depp DIOR "Homme"')
+        assert a == "Ry Cooder"
+        assert t == "Dior wild man"
+
+    def test_plain_dash(self):
+        from bot.handler import _split_yt_reference
+        assert _split_yt_reference("Scorpions - Wind of Change (Official Video)") == (
+            "Scorpions", "Wind of Change")
+
+    def test_no_dash_gives_nothing(self):
+        from bot.handler import _split_yt_reference
+        assert _split_yt_reference("Dior wild man Johnny Depp") == ("", "")
+
+    def test_pseudo_artist_rejected(self):
+        from bot.handler import _split_yt_reference
+        assert _split_yt_reference("Various Artists - Big Blues Collection")[0] == ""
+
+    def test_overlong_artist_rejected(self):
+        from bot.handler import _split_yt_reference
+        assert _split_yt_reference(
+            "The Best Slide Guitar Blues Ballads Of All Times - Dior wild man")[0] == ""

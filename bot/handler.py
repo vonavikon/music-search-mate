@@ -871,7 +871,7 @@ _MONTHS_RU = ("января", "февраля", "марта", "апреля", "�
 
 def _daily_reset_str(lang: str = "ru") -> str:
     import datetime as _dt
-    d = _dt.date.today() + _dt.timedelta(days=1)
+    d = _dt.datetime.now(_dt.timezone.utc).date() + _dt.timedelta(days=1)
     if lang == "en":
         return f"{_MONTHS_EN[d.month - 1]} {d.day}"
     return f"{d.day} {_MONTHS_RU[d.month - 1]}"
@@ -955,11 +955,14 @@ async def _maybe_wtp(update, context, user, trigger: str, feature: str, usage_n:
         pass
 
 
-async def _do_search(update, context, status, desc, excluded_ids=None):
+async def _do_search(update, context, status, desc, excluded_ids=None,
+                     excluded_artists=None):
     """Streaming status + search_candidates. Returns SearchOut or None (error already shown).
 
     excluded_ids — rejected video_ids (refinement), passed to search_candidates for
-    deterministic exclusion before ranking. Shared path for new searches and refinements."""
+    deterministic exclusion before ranking. excluded_artists — _ref_key of rejected
+    candidates' channels (a miss streak drops the whole wrong neighborhood).
+    Shared path for new searches and refinements."""
     bothub = context.bot_data["bothub"]
     _t_search0 = time.monotonic()  # query latency for the queries table
     # /new cuts off history - take only queries after the marker
@@ -1046,7 +1049,9 @@ async def _do_search(update, context, status, desc, excluded_ids=None):
                         update.effective_chat.id if update.effective_chat else None, desc)
     try:
         out = await search_candidates(desc, bothub, context=ctx_history,
-                                      excluded_ids=excluded_ids, on_progress=on_progress,
+                                      excluded_ids=excluded_ids,
+                                      excluded_artists=excluded_artists,
+                                      on_progress=on_progress,
                                       metadata_svc=context.bot_data.get("metadata"),
                                       trace=trace)
     except Exception:
@@ -1362,6 +1367,30 @@ async def _handle_url(update, context, media, user, url, desc):
         "channel": meta.get("channel") or "",
         "meta_ms": int((time.monotonic() - _t_meta0) * 1000),
     }
+
+
+
+def _split_yt_reference(title: str) -> tuple[str, str]:
+    """("Artist", "Track") from a raw YouTube title, or ("", "").
+
+    URL tracks carry ad junk in the title ("Ry Cooder – Dior wild man (Full
+    Official Track) Johnny Depp DIOR..."): the artist sits before the dash
+    separator and the track part survives only until the first bracket.
+    Any dash form (-, –, —); the artist is sanity-checked (length, not a
+    pseudo-artist) before being trusted as a similar-reference.
+    """
+    t = (title or "").strip()
+    parts = re.split(r"\s+[-\u2013\u2014]\s+", t, maxsplit=1)
+    if len(parts) != 2:
+        return "", ""
+    artist, track = parts[0].strip(), parts[1].strip()
+    track = re.sub(r"[(\[|].*", "", track).strip(" -\u2013\u2014|")
+    from services.metadata import _is_pseudo_artist
+    if not (2 <= len(artist) <= 40) or not (2 <= len(track) <= 60):
+        return "", ""
+    if _is_pseudo_artist(artist):
+        return "", ""
+    return artist, track
 
 
 def _button_label(title: str, channel: str) -> str:
@@ -2535,8 +2564,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = await q.message.reply_text(await _status_text(update.effective_user.id, "st_similar"))
         if await _sends_over(update, context, user):
             return
-        artist = store.get("resolved_artist") or cur.channel
-        track = store.get("resolved_track") or cur.title
+        artist = store.get("resolved_artist") or ""
+        track = store.get("resolved_track") or ""
+        if not artist or not track:
+            if store.get("intent") == "direct_url":
+                # URL tracks: the raw YouTube title carries ad junk — split
+                # "Artist – Track (junk)" before it becomes the reference
+                sp_a, sp_t = _split_yt_reference(cur.title)
+                artist = artist or sp_a or cur.channel
+                track = track or sp_t or cur.title
+            else:
+                artist = artist or cur.channel
+                track = track or cur.title
         # Same reference within _SIM_REUSE_WINDOW and unseen candidates of the same
         # kind left in the pool -> the next one from the pool, without the pipeline
         # (a repeated "Похожее" used to rerun a full 25-38s search).
@@ -2588,6 +2627,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if store is not None and cur and cur.video_id not in store.get("rejected_ids", []):
             store.setdefault("rejected_ids", []).append(cur.video_id)
             await _save_state(context, query_id, store)  # rejected_ids survives a restart
+
+        # A miss streak means the POOL is wrong (wrong reference resolved,
+        # wrong neighborhood), not just the pick: a third candidate from the
+        # same pool would be the same direction (the Ry Cooder case kept
+        # offering folk tracks). After two consecutive misses re-search with
+        # the rejected titles as explicit negatives and their uploaders
+        # excluded entirely; fall back to the next candidate if it fails.
+        streak = len(store.get("rejected_ids", [])) if store else 0
+        if streak >= 2 and candidates:
+            rej_titles = [c.title for c in candidates
+                          if c.video_id in (store.get("rejected_ids") or [])][:3]
+            rej_artists = {_ref_key((c.channel or "").removesuffix(" - Topic"))
+                           for c in candidates
+                           if c.video_id in (store.get("rejected_ids") or [])}
+            base_desc = store.get("desc", "")
+            if store.get("intent") == "direct_url":
+                sp_a, sp_t = _split_yt_reference(
+                    candidates[0].title if candidates else "")
+                if sp_a and sp_t:
+                    base_desc = f"похожие на {sp_t} - {sp_a}"
+            desc2 = base_desc + ("\nНе то: " + "; ".join(rej_titles) if rej_titles else "")
+            if await _sends_over(update, context, user):
+                return
+            status = await q.message.reply_text(await _status_text(update.effective_user.id, "st_other"))
+            out = await _do_search(update, context, status, desc2,
+                                   excluded_ids=set(store.get("rejected_ids") or []),
+                                   excluded_artists={a for a in rej_artists if a})
+            if out is not None and out.candidates:
+                await _finish_search(update, context, status, out, desc2, user)
+                return
+            # search failed -> old behavior below (next candidate from the pool)
 
         # miss -> the next candidate (limit: best + 3 more, DoS protection via "Не то")
         if not candidates or rank + 1 >= len(candidates):

@@ -947,7 +947,14 @@ async def _resolve_reference(reference: dict, metadata_svc, trace=None, bothub=N
                             if want and want in _ref_key(m["artist"]):
                                 out["artist"], out["source"] = ref_artist, "lastfm-track-search"
                                 break
-                if out["source"] == "llm" and chosen is None and not _is_pseudo_artist(matches[0]["artist"]):
+                # Top-by-listeners is a fallback for when the LLM could NOT
+                # name an artist. With ref_artist given and confirmed by no
+                # match, matches[0] is a fuzzy hit of a noisy title ("Dior
+                # wild man (Full Official Track) Johnny Depp DIOR..." once
+                # resolved Ry Cooder into a Swedish folk singer and the whole
+                # neighborhood turned folk) — distrust it and try yt-dlp.
+                if (out["source"] == "llm" and chosen is None and not ref_artist
+                        and not _is_pseudo_artist(matches[0]["artist"])):
                     chosen = matches[0]
                 if chosen and out["source"] == "llm":
                     out["artist"], out["source"] = chosen["artist"], "lastfm-track-search"
@@ -955,6 +962,12 @@ async def _resolve_reference(reference: dict, metadata_svc, trace=None, bothub=N
         if out["source"] == "llm" and ref_track:
             phrase = " ".join(x for x in (ref_artist, ref_track) if x).strip()
             raw = await search_metadata([phrase], per_query=3)
+            if ref_artist:
+                # A channel repeating the reference artist is the strongest
+                # signal; the ad-video channel from the same junk title
+                # must not win the pick.
+                raw = sorted(raw, key=lambda c: _ref_key(ref_artist)
+                             not in _ref_key(c.get("channel") or ""))
             for c in raw:
                 ch = (c.get("channel") or "").strip()
                 title = c.get("title") or ""
@@ -1106,6 +1119,7 @@ async def search_candidates(
     bothub: BothubClient,
     context: list[dict] | None = None,
     excluded_ids: set[str] | None = None,
+    excluded_artists: set[str] | None = None,
     on_progress=None,
     metadata_svc=None,  # MetadataService or None: optional Last.fm enrichment layer
     trace=None,  # tracing.SearchTrace: trace of this search; None = no tracing
@@ -1113,10 +1127,12 @@ async def search_candidates(
     """description -> SearchOut. context is recent queries (recent_context).
     excluded_ids are video_ids the user already rejected in the refinement
     loop: dropped before ranking so the bot never returns an already
-    rejected clip. metadata_svc powers the second metadata pass over the
-    top-5 candidates: yt-dlp extract_info + Last.fm; None (or no key) →
-    extract_info only. on_progress(stage, text) is an async callback for
-    streaming status."""
+    rejected clip. excluded_artists are _ref_key-normalized channel names
+    of rejected candidates: after a miss streak the whole neighborhood is
+    dropped, not just the clips (direction change). metadata_svc powers the
+    second metadata pass over the top-5 candidates: yt-dlp extract_info +
+    Last.fm; None (or no key) → extract_info only. on_progress(stage, text)
+    is an async callback for streaming status."""
 
     # Deterministic pre-LLM gate — before the first network call.
     gate_need, gate_q = _pre_search_gate(description)
@@ -1249,6 +1265,17 @@ async def search_candidates(
         filtered = [c for c in filtered if c["video_id"] not in excluded_ids]
         if before != len(filtered):
             _log.info("refinement: dropped %d previously-rejected video_id(s)", before - len(filtered))
+    # Consecutive misses: also drop everything by the rejected uploaders —
+    # a wrong-direction pool keeps offering the same neighborhood even with
+    # the video_ids excluded (the "Ry Cooder resolved to a folk singer" case:
+    # every next candidate was another folk track).
+    if excluded_artists:
+        before = len(filtered)
+        filtered = [c for c in filtered
+                    if _ref_key((c.get("channel") or "").removesuffix(" - Topic"))
+                    not in excluded_artists]
+        if before != len(filtered):
+            _log.info("direction change: dropped %d candidate(s) from rejected artists", before - len(filtered))
     if on_progress:
         await on_progress("filter", f"Отобрано {len(filtered)} вариантов")
 

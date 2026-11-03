@@ -428,6 +428,10 @@ async def test_usage_migration_null_backfill(store_db):
     """An old usage table without facts/videos columns.
     ALTER without DEFAULT produced NULLs: incr NULL+1=NULL, and .get() returned None."""
     import aiosqlite as _a
+    from datetime import datetime, timezone
+    # incr_usage writes into TODAY's row: a hardcoded date broke the test at
+    # the first UTC midnight after it was written
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     async with _a.connect(str(store_db)) as db:
         await db.execute(
             """CREATE TABLE usage_old (
@@ -436,15 +440,15 @@ async def test_usage_migration_null_backfill(store_db):
                  bytes_sent INTEGER DEFAULT 0, updated_at REAL NOT NULL,
                  PRIMARY KEY (user_id, day))""")
         await db.execute(
-            "INSERT INTO usage_old VALUES (7, '2026-11-03', 3, 4, 0, 1.0)")
+            "INSERT INTO usage_old VALUES (7, ?, 3, 4, 0, 1.0)", (day,))
         await db.execute("ALTER TABLE usage_old RENAME TO usage")
         await db.commit()
     await store.init_db()  # migration + backfill
 
-    u = await store.get_usage(7, day="2026-11-03")
+    u = await store.get_usage(7, day=day)
     assert u["facts"] == 0 and u["videos"] == 0  # zero, not None
     await store.incr_usage(7, "facts")
-    u = await store.get_usage(7, day="2026-11-03")
+    u = await store.get_usage(7, day=day)
     assert u["facts"] == 1  # NULL+1 is no longer NULL
 
 

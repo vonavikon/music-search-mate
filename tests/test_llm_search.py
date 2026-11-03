@@ -1267,3 +1267,56 @@ async def test_fallback_sets_degraded_flag(bothub_client):
     assert out.degraded is True
     assert out.intent is None
     assert len(out.candidates) == 3
+
+
+@pytest.mark.asyncio
+async def test_resolve_distrusts_top_listener_on_artist_mismatch(monkeypatch):
+    """The Ry Cooder case (03.11): a junk YouTube title ("Dior wild man (Full
+    Official Track) Johnny Depp DIOR...") hit Last.fm, no match carried the
+    reference artist, and matches[0] (a Swedish folk singer by listeners)
+    became the canonical artist — the whole neighborhood turned folk.
+    With ref_artist given but unmatched, the top-listener fallback must NOT
+    fire: the artist stays as-is for the yt-dlp step."""
+    from services import llm_search as ls
+
+    class _Meta:
+        async def track_search(self, track, limit=8):
+            return [{"artist": "The Tallest Man on Earth", "listeners": 800000},
+                    {"artist": "Iron & Wine", "listeners": 700000}]
+        async def similar_artists(self, artist, limit=10):
+            return ["wrong-neighbor"]
+
+    async def fake_search_metadata(queries, per_query=3):
+        return []  # yt-dlp step finds nothing: artist must simply stay
+
+    monkeypatch.setattr(ls, "search_metadata", fake_search_metadata)
+    out = await ls._resolve_reference(
+        {"artist": "Ry Cooder", "track": "Dior wild man"}, _Meta(), bothub=None)
+    assert out["artist"] == "Ry Cooder"
+    assert out["source"] == "llm"
+    # neighbors are for the KEPT artist (mock returns one for anyone);
+    # the point is the folk singer never became the canonical artist
+    assert out["neighbors"] == ["wrong-neighbor"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_prefers_channel_matching_reference(monkeypatch):
+    """yt-dlp fallback: a channel repeating the reference artist outranks the
+    ad channel that uploaded the junk-titled video."""
+    from services import llm_search as ls
+
+    class _Meta:
+        async def track_search(self, track, limit=8):
+            return []
+
+    async def fake_search_metadata(queries, per_query=3):
+        return [
+            {"channel": "DIOR", "title": "Dior wild man", "duration": 90},
+            {"channel": "Ry Cooder - Topic", "title": "Ry Cooder Dior wild man", "duration": 200},
+        ]
+
+    monkeypatch.setattr(ls, "search_metadata", fake_search_metadata)
+    out = await ls._resolve_reference(
+        {"artist": "Ry Cooder", "track": "Dior wild man"}, _Meta(), bothub=None)
+    assert out["artist"] == "Ry Cooder"
+    assert out["source"] == "ytdlp-channel"

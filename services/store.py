@@ -292,9 +292,26 @@ async def funnel_today() -> dict:
     return out
 
 
-def _day_start() -> float:
+
+def _utc_today() -> str:
+    """The UTC day in ISO format.
+
+    All daily counters and the funnel live in UTC (the production container
+    runs UTC; incr_usage used local date.today() and on any non-UTC host the
+    counters would drift from the UTC funnel window)."""
     import datetime as _dt
-    return _dt.datetime.combine(_dt.date.today(), _dt.time.min).timestamp()
+    return _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+
+
+def _utc_day_start_ts() -> float:
+    """Timestamp of the current UTC midnight."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    return _dt.datetime.combine(now.date(), _dt.time.min, tzinfo=_dt.timezone.utc).timestamp()
+
+def _day_start() -> float:
+    """Start of the current UTC day (the funnel window)."""
+    return _utc_day_start_ts()
 
 
 async def count_recent(user_id: int, hours: int = 1) -> int:
@@ -329,7 +346,7 @@ async def set_user_lang(user_id: int, lang: str) -> None:
 async def get_usage(user_id: int, day: str | None = None) -> dict:
     """The user's usage counters for a day. day defaults to today."""
     import datetime as _dt
-    day = day or _dt.date.today().isoformat()
+    day = day or _utc_today()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -350,7 +367,7 @@ async def incr_usage(user_id: int, field: str, amount: int = 1) -> None:
     heals pre-existing NULL rows between restarts."""
     assert field in ("searches", "urls", "facts", "videos", "sends", "bytes_sent")
     import datetime as _dt
-    day = _dt.date.today().isoformat()
+    day = _utc_today()
     vals = {"searches": 0, "urls": 0, "facts": 0, "videos": 0,
             "sends": 0, "bytes_sent": 0}
     vals[field] = amount
@@ -370,7 +387,7 @@ async def incr_usage(user_id: int, field: str, amount: int = 1) -> None:
 async def get_global_usage(day: str | None = None) -> dict:
     """Total usage of ALL users for a day (global budget)."""
     import datetime as _dt
-    day = day or _dt.date.today().isoformat()
+    day = day or _utc_today()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT COALESCE(SUM(searches),0) as s, COALESCE(SUM(urls),0) as u, "
