@@ -4,7 +4,7 @@
 [![tests](https://github.com/vonavikon/music-search-mate/actions/workflows/tests.yml/badge.svg)](https://github.com/vonavikon/music-search-mate/actions/workflows/tests.yml)
 <!-- VT badge after pre-release scan -->
 
-[RU](README.ru.md) · **EN**
+[Русский](README.ru.md) · **English** · [中文](README.zh.md) · [Español](README.es.md) · [Français](README.fr.md)
 
 A Telegram bot that finds music from a free-form description: "AC/DC, but something more modern, and in German", "the song from the taxi chase with the Mercedes", "similar to Moody Blues, Nights in White Satin". It also downloads audio and video by link, up to 2 GB per file through a self-hosted local Bot API server. A live instance is running: [@music_search_mate_bot](https://t.me/music_search_mate_bot).
 
