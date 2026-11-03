@@ -7,5 +7,5 @@ yt-dlp>=2025.5.22
 httpx==0.28.1
 aiosqlite==0.22.1
 python-dotenv==1.0.1
-# v1.10: трейсинг пайплайна в Langfuse (self-host skrime); без ключей SDK пассивен
+# v1.10: pipeline tracing via a self-hosted Langfuse; without keys the SDK stays passive
 langfuse==4.18.0

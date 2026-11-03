@@ -461,8 +461,8 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _denied(update, context):
         await update.message.reply_text(await _t(user.id, 'guest'))
         return
-    # mig_nova deep-link from the old bot's broadcast — conversion tracking
-    # and a smart re-broadcast (excluding those who already came over)
+    # mig_nova deep-link payload from the migration broadcast: conversion
+    # tracking and a smart re-broadcast (excluding those who already came over)
     if _mig_nova_payload(context):
         await insert_event(user_id=user.id, kind="mig_nova")
         log.info("mig_nova arrival user=%s", user.id)
@@ -1248,7 +1248,8 @@ async def _handle_url(update, context, media, user, url, desc):
     dur = meta.get("duration") or 0
 
     # Owner's variant A: URL -> Audio/Video buttons
-    # (like nova, familiar to migrants). Audio = m4a as now, Video = quality picker.
+    # (the layout the previous bot used, familiar to migrating users).
+    # Audio = m4a as now, Video = quality picker.
     _lang = await _lang_of(update.effective_user.id)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(_kbt(_lang, "audio"), callback_data=f"dl:aud:{vid}"),
@@ -1559,8 +1560,8 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                     except Exception:
                         pass
 
-                # Thumbnail = album cover (like nova; the owner confirmed
-                # Telegram shows it in the player). The fd is closed in finally (it leaked
+                # Thumbnail = album cover (the owner confirmed Telegram
+                # shows it in the player). The fd is closed in finally (it leaked
                 # on a send failure); the download goes through async with (the client
                 # wasn't closed); the file is unique (a fixed /tmp/tg_thumb.jpg raced
                 # between parallel chats).
@@ -2452,7 +2453,7 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=_PM.HTML)
 
 
-# ════ /donate with Stars (a port of nova's invoice, XTR) ════
+# ════ /donate with Stars (Telegram invoice, XTR) ════
 
 _DONATE_STARS = (50, 100, 300)
 

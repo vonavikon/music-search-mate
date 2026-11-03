@@ -47,7 +47,7 @@ Video version: [demo.mp4](assets/demo.mp4)
 - **Caches:** Telegram file_id (a track sent before is re-sent without downloading again), fact cache, similar pools, Last.fm lookups with a TTL.
 - **Groups:** the bot reacts only to @mentions (privacy mode off plus an explicit gate in code); per-user limits apply everywhere.
 - **Localization:** RU/EN for errors, statuses, buttons, and the clarifying questions the LLM asks; switch with /lang.
-- **Limits, in pieces not gigabytes:** 20 requests per hour per user, 100 searches and 30 videos per day, 2 facts per day (cache hits are free), plus global daily budgets for everyone.
+- **Limits, in pieces not gigabytes:** 20 requests per hour per user, 100 searches a day on the live instance (code default 200, set by env) and 30 videos per day, 2 facts per day (cache hits are free), plus global daily budgets for everyone.
 - **Honest progress:** a percent progress bar (updates roughly every 3% / 1.2 s) and a separate "preparing file" stage while the file is converted, tagged, and uploaded.
 - **Observability:** a SQLite funnel of request outcomes (ok / clarify / empty / blocked / limit / error) and optional Langfuse tracing of every pipeline stage; tracing stays off without keys.
 
