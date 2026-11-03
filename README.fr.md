@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![tests](https://github.com/vonavikon/music-search-mate/actions/workflows/tests.yml/badge.svg)](https://github.com/vonavikon/music-search-mate/actions/workflows/tests.yml)
-<!-- VT badge after pre-release scan -->
+[![VirusTotal](https://img.shields.io/badge/VirusTotal-0%2F61_clean-brightgreen)](https://www.virustotal.com/gui/file/61c789f0735b0a6d59184576371bf35c2008aef816a0775b528ef53e3ed7459f)
 
 [Русский](README.ru.md) · [English](README.md) · [中文](README.zh.md) · [Español](README.es.md) · **Français**
 
