@@ -507,8 +507,9 @@ class TestFunnel46:
     """Funnel: outcome/latency in queries, events, funnel_today."""
 
     @pytest.mark.asyncio
-    async def test_outcome_latency_persisted(self, db_path, monkeypatch):
+    async def test_outcome_latency_persisted(self, store_db):
         import services.store as st
+        await st.init_db()
         qid = await st.insert_query(
             user_id=1, correlation_id="c1", description="тест", intent="similar",
             signals=None, queries=None, candidates=None,
@@ -519,9 +520,11 @@ class TestFunnel46:
         assert row[0] == ("blocked", 42)
 
     @pytest.mark.asyncio
-    async def test_event_and_funnel(self, db_path, monkeypatch):
+    async def test_event_and_funnel(self, store_db):
         import services.store as st
-        # db_path is shared across the run: compare DELTAS, not absolutes
+        # store_db is isolated per test; deltas stay meaningful if the
+        # fixture ever becomes shared again
+        await st.init_db()
         base = await st.funnel_today()
         b_dl = base["events"].get("dl_audio", 0)
         b_fa = base["events"].get("fact", 0)
@@ -536,7 +539,7 @@ class TestFunnel46:
         assert f.get("feedback", {}).get("hit", 0) - b_hit == 1
 
     @pytest.mark.asyncio
-    async def test_migration_backfills_ok(self, db_path, monkeypatch):
+    async def test_migration_backfills_ok(self, store_db):
         import services.store as st
         await st.init_db()
         async with st.aiosqlite.connect(st.DB_PATH) as db:
@@ -549,9 +552,10 @@ class TestOutcomeLog48:
     """All refusal outcomes are recorded in the funnel."""
 
     @pytest.mark.asyncio
-    async def test_log_outcome_persists(self, db_path, monkeypatch):
+    async def test_log_outcome_persists(self, store_db):
         import services.store as st
         from bot.handler import _log_outcome
+        await st.init_db()
         await _log_outcome(99, "тестовый деструктив", "blocked", latency_ms=7)
         async with st.aiosqlite.connect(st.DB_PATH) as db:
             rows = await db.execute_fetchall(
