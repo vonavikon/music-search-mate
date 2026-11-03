@@ -1,0 +1,11 @@
+# заход 40: апгрейд 20.7 → 22.8 одним шагом (Bot API 10.0, refund_star_payment,
+# media_write_timeout, каноничный XTR); httpx 0.28.x обязателен (22.2+ требует >=0.27,<0.29)
+python-telegram-bot[rate-limiter]==22.8
+# yt-dlp: стабильная версия здесь только как база; рабочий nightly-шаг
+# (лечит 403-волну 2026-08-17 на датацентровом IP) ставится в Dockerfile
+yt-dlp>=2025.5.22
+httpx==0.28.1
+aiosqlite==0.22.1
+python-dotenv==1.0.1
+# v1.10: трейсинг пайплайна в Langfuse (self-host skrime); без ключей SDK пассивен
+langfuse==4.18.0

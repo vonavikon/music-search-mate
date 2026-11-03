@@ -1,0 +1,44 @@
+# Public self-hosting setup for music-search-mate.
+# Copy .env.example to .env, fill in BOT_TOKEN and BOTHUB_API_KEY, then:
+#   docker compose -f docker-compose.public.yml up -d --build
+
+services:
+  bot:
+    build: .
+    container_name: music-search-mate
+    restart: unless-stopped
+    # Long uploads (up to 2 GB via the local Bot API) need time to finish on
+    # stop; the default 10s SIGKILL would kill them silently.
+    stop_grace_period: 600s
+    env_file: .env
+    volumes:
+      - ./data:/app/data  # SQLite DB and temp files stay persistent
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Local Bot API server: raises the upload limit from 50 MB to 2 GB.
+  # Enable it for files larger than 50 MB: run with `--profile local-api`
+  # and set TELEGRAM_LOCAL=1 plus TG_API_ID/TG_API_HASH in .env. The bot picks
+  # up the server via LOCAL_BOT_API_URL from .env (default http://tgapi:8081,
+  # see config.py); empty = regular cloud api.telegram.org.
+  # On first switch from the cloud API, call logOut once so updates stop going
+  # to api.telegram.org:
+  #   curl "https://api.telegram.org/bot$BOT_TOKEN/logOut"
+  tgapi:
+    image: aiogram/telegram-bot-api:latest
+    profiles: ["local-api"]
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_API_ID=${TG_API_ID}
+      - TELEGRAM_API_HASH=${TG_API_HASH}
+      - TELEGRAM_LOCAL=${TELEGRAM_LOCAL:-1}
+    volumes:
+      - ./data/tgapi:/var/lib/telegram-bot-api
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata in this file."
+title: music-search-mate
+version: 1.17.0
+authors:
+  - name: vonavikon
+type: software
+repository-code: "https://github.com/vonavikon/music-search-mate"
+url: "https://github.com/vonavikon/music-search-mate"
+abstract: "Telegram bot that finds music from a plain-language description: an LLM turns it into search queries, yt-dlp fetches the track, and the bot sends it back as audio (files up to 2 GB via a local Bot API server)."
+keywords:
+  - telegram-bot
+  - music-search
+  - yt-dlp
+  - llm
+  - python
+license: MIT
