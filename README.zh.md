@@ -10,8 +10,8 @@
 
 一个能根据自由文字描述找到音乐的 Telegram 机器人："AC/DC，但要更现代一点的，用德语唱的"、"出租车追奔驰那场追车戏里的那首歌"、"和 Moody Blues 的 Nights in White Satin 相似的"。它还能按链接下载音频和视频，通过自托管的本地 Bot API 服务器，单文件最大 2 GB。目前有一个在线实例在运行：[@music_search_mate_bot](https://t.me/music_search_mate_bot)。
 
-![演示：按描述搜索，返回带封面和"命中 / 未命中"按钮的曲目卡片](assets/demo.webp)
-视频版本：[demo.mp4](assets/demo.mp4)
+<p align="center"><img src="assets/demo.gif" alt="演示：按描述搜索，返回带封面和按钮的曲目卡片" width="420"></p>
+完整画质视频：[demo.mp4](assets/demo.mp4)
 
 ## 工作原理
 

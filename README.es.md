@@ -10,8 +10,8 @@
 
 Un bot de Telegram que encuentra música a partir de una descripción libre: "AC/DC, pero algo más moderno, y en alemán", "la canción de la persecución en taxi con el Mercedes", "parecido a Moody Blues, Nights in White Satin". También descarga audio y vídeo por enlace, hasta 2 GB por archivo a través de un servidor local autoalojado de la Bot API. Hay una instancia en vivo funcionando: [@music_search_mate_bot](https://t.me/music_search_mate_bot).
 
-![Demo: una búsqueda por descripción devuelve una tarjeta del tema con portada y botones de acierto/fallo](assets/demo.webp)
-Versión en vídeo: [demo.mp4](assets/demo.mp4)
+<p align="center"><img src="assets/demo.gif" alt="Demo: una búsqueda por descripción devuelve una tarjeta del tema con portada y botones" width="420"></p>
+Vídeo con calidad completa: [demo.mp4](assets/demo.mp4)
 
 ## Cómo funciona
 
