@@ -1,5 +1,7 @@
 # Music Search Mate
 
+<p align="center"><img src="assets/logo.png" width="150" alt="Music Search Mate logo"></p>
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![tests](https://github.com/vonavikon/music-search-mate/actions/workflows/tests.yml/badge.svg)](https://github.com/vonavikon/music-search-mate/actions/workflows/tests.yml)
 <!-- VT badge after pre-release scan -->
