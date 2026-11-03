@@ -569,3 +569,51 @@ class TestOutcomeLog48:
         src = open(h.__file__, encoding="utf-8").read()
         # 6 call sites (blocked/hourly/ssrf/search-limit/url-limit/empty)
         assert len(_re.findall(r"await _log_outcome\(", src)) >= 6
+
+
+class TestAnalyticsCols:
+    """Analytics 2.0: chat_type and llm_model on queries (where the query
+    came from and which model ran it), plus migration from an old schema."""
+
+    @pytest.mark.asyncio
+    async def test_chat_type_llm_model_roundtrip(self, store_db):
+        import services.store as st
+        await st.init_db()
+        qid = await st.insert_query(
+            user_id=7, correlation_id="c7", description="rock", intent="this_track",
+            signals=None, queries=None, candidates=None,
+            best_video_id="v1", best_title="T", best_score=0.9,
+            confidence="high", match_score=0.8,
+            outcome="ok", latency_ms=100, chat_type="supergroup", llm_model="deepseek-v4-pro")
+        async with st.aiosqlite.connect(str(store_db)) as db:
+            row = await db.execute_fetchall(
+                "SELECT chat_type, llm_model FROM queries WHERE id=?", (qid,))
+        assert row[0] == ("supergroup", "deepseek-v4-pro")
+
+    @pytest.mark.asyncio
+    async def test_old_schema_gets_analytics_cols(self, tmp_path, monkeypatch):
+        """A pre-Analytics-2.0 database (no chat_type/llm_model) is migrated."""
+        import services.store as st
+        old = tmp_path / "old.db"
+        import aiosqlite
+        async with aiosqlite.connect(old) as db:
+            await db.execute("""CREATE TABLE queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
+                user_id INTEGER NOT NULL, correlation_id TEXT, description TEXT NOT NULL,
+                intent TEXT, signals_json TEXT, queries_json TEXT, candidates_json TEXT,
+                best_video_id TEXT, best_title TEXT, best_score REAL, confidence TEXT,
+                match_score REAL, auto_download INTEGER, ambiguous INTEGER,
+                outcome TEXT, latency_ms INTEGER)""")
+            await db.execute(
+                "INSERT INTO queries (created_at, user_id, description, outcome) "
+                "VALUES (1, 1, 'old row', 'ok')")
+            await db.commit()
+        monkeypatch.setattr("services.store.DB_PATH", str(old))
+        monkeypatch.setattr("services.store.DATA_DIR", tmp_path)
+        await st.init_db()
+        async with aiosqlite.connect(str(old)) as db:
+            cols = [r[1] for r in await db.execute_fetchall("PRAGMA table_info(queries)")]
+            row = await db.execute_fetchall(
+                "SELECT chat_type, llm_model, outcome FROM queries WHERE user_id=1")
+        assert "chat_type" in cols and "llm_model" in cols
+        assert row[0] == (None, None, "ok")  # old rows untouched, columns added

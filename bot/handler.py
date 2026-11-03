@@ -579,14 +579,15 @@ async def _status_text(user_id, kind: str = "pool") -> str:
     return await _t(user_id, kind)
 
 
-async def _log_outcome(user_id, desc, outcome: str, latency_ms: int | None = None) -> None:
+async def _log_outcome(user_id, desc, outcome: str, latency_ms: int | None = None,
+                       chat_type: str | None = None) -> None:
     """Refusal outcome into the funnel (silent) — backfills points missed earlier."""
     try:
         await insert_query(user_id=user_id, correlation_id=uuid4().hex,
                            description=desc, intent=None, signals=None, queries=None,
                            candidates=None, best_video_id=None, best_title=None,
                            best_score=None, confidence=None, match_score=None,
-                           outcome=outcome, latency_ms=latency_ms)
+                           outcome=outcome, latency_ms=latency_ms, chat_type=chat_type)
     except Exception:
         pass
 
@@ -747,7 +748,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _dcat:
         log.warning("destructive query blocked (regex) cat=%s user=%s",
                     _dcat, user.id if user else 0)
-        await _log_outcome(user.id, desc, "blocked")
+        await _log_outcome(user.id, desc, "blocked",
+                           chat_type=update.effective_chat.type if update.effective_chat else None)
         await update.message.reply_text(await _t(user.id, "destructive"))
         return
 
@@ -770,7 +772,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         n = await count_recent(user.id, hours=1)
         if n >= cfg.user_rate_limit_per_hour:
-            await _log_outcome(user.id, desc, "limit")
+            await _log_outcome(user.id, desc, "limit",
+                               chat_type=update.effective_chat.type if update.effective_chat else None)
             await update.message.reply_text(await _t(user.id, "hourly"))
             return
 
@@ -809,7 +812,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url = _looks_like_url(desc)
         if url:
             if not _url_host_allowed(url, cfg.url_allowed_hosts):
-                await _log_outcome(user.id, desc, "ssrf")
+                await _log_outcome(user.id, desc, "ssrf",
+                                   chat_type=update.effective_chat.type if update.effective_chat else None)
                 await update.message.reply_text(await _t(user.id, "host_not_allowed"))
                 return
             await _handle_url(update, context, media, user, url, desc)
@@ -1025,7 +1029,8 @@ async def _do_search(update, context, status, desc, excluded_ids=None):
     allowed, reason = await _check_limits(update, context, update.effective_user, "search")
     if not allowed:
         await _log_outcome(update.effective_user.id, desc, "limit",
-                           latency_ms=int((time.monotonic() - _t_search0) * 1000))
+                           latency_ms=int((time.monotonic() - _t_search0) * 1000),
+                           chat_type=update.effective_chat.type if update.effective_chat else None)
         # without cancel both indicator tasks lived forever
         # (typing every 4.5s indefinitely, stacking on every refusal)
         prog["alive"] = False
@@ -1094,14 +1099,15 @@ async def _finish_search(update, context, status, out, desc, user):
         head = (out.intro + "\n\n") if out.intro else ""
         await status.edit_text(head + await _t(update.effective_user.id, "nothing_found"))
         await _log_outcome(update.effective_user.id, desc, "empty",
-                           latency_ms=getattr(out, "latency_ms", None))
+                           latency_ms=getattr(out, "latency_ms", None),
+                           chat_type=update.effective_chat.type if update.effective_chat else None)
         if getattr(out, "trace", None):
             out.trace.finish(output={"decision": "empty"})
         return
 
     # auto-download is decided by the rule-based match-score, not LLM confidence.
     # should_auto_download: from_source is always preview (1/8 hit); this_track at
-    # score>=0.65, similar at >=0.70. Thresholds per intent — this_track is softer
+    # score>=0.65, similar at >=0.85. Thresholds per intent — this_track is softer
     # (exact comparison target + both+fid bonus), similar is stricter (we trust the LLM rank).
     best = out.candidates[out.best_index] if 0 <= out.best_index < len(out.candidates) else None
     # Even past the auto-download threshold, an ambiguous choice (a close second
@@ -1130,6 +1136,8 @@ async def _finish_search(update, context, status, out, desc, user):
         ambiguous=ambiguous,
         outcome=_outcome,
         latency_ms=getattr(out, "latency_ms", None),
+        chat_type=(update.effective_chat.type if update.effective_chat else None),
+        llm_model=getattr(context.bot_data.get("cfg"), "llm_model", None),
     )
     # desc and rejected_ids are needed for refinement: desc is the original query to
     # merge with the edit; rejected_ids accumulate on "Не то" and feed the next search's exclude.
@@ -1306,10 +1314,12 @@ async def _handle_url(update, context, media, user, url, desc):
     # URL limit gate
     allowed, reason = await _check_limits(update, context, user, "url")
     if not allowed:
-        await _log_outcome(user.id, desc, "limit")
+        await _log_outcome(user.id, desc, "limit",
+                           chat_type=update.effective_chat.type if update.effective_chat else None)
         await update.message.reply_text(reason)
         return
     status = await update.message.reply_text(await _status_text(update.effective_user.id, "st_url"))
+    _t_meta0 = time.monotonic()  # URL pipeline latency for the queries table
     try:
         meta = await media.extract_url_meta(url)
     except Exception:
@@ -1347,7 +1357,10 @@ async def _handle_url(update, context, media, user, url, desc):
         f"🔗 {title[:200]}\n⏱ {dur_str}",
         reply_markup=kb)
     # state for callback handling
-    context.chat_data[f"url:{vid}"] = {"url": url, "title": title}
+    context.chat_data[f"url:{vid}"] = {
+        "url": url, "title": title,
+        "meta_ms": int((time.monotonic() - _t_meta0) * 1000),
+    }
 
 
 def _button_label(title: str, channel: str) -> str:
@@ -2095,11 +2108,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # "Уточнить" from the top-3 preview: rephrase the query (without the rejected track)
     if kind == "rn":
-        await insert_event(user_id=update.effective_user.id, kind="refine")
         nums = _ints(1)
         if nums is None:
             return
         (query_id,) = nums
+        await insert_event(user_id=update.effective_user.id, kind="refine",
+                           query_id=query_id)
         store = await _load_state(context, query_id)
         if not store:
             await q.message.reply_text(await _t(update.effective_user.id, "search_cold"))
@@ -2126,11 +2140,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # "Уточнить" on a delivered track: refinement with the rejected excluded.
     # rejected = everything rejected via "Не то" earlier + the currently shown clip.
     if kind == "rf":
-        await insert_event(user_id=update.effective_user.id, kind="refine")
         nums = _ints(1, 2)
         if nums is None:
             return
         query_id, rank = nums
+        await insert_event(user_id=update.effective_user.id, kind="refine",
+                           query_id=query_id)
         store = await _load_state(context, query_id)
         if not store or rank < 0 or rank >= len(store["candidates"]):
             await q.message.reply_text(await _t(update.effective_user.id, "search_cold"))
@@ -2234,7 +2249,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id=user.id, correlation_id=uuid4().hex,
                 description=f"url: {title}", intent="direct_url",
                 signals=None, queries=[url], candidates=[cand.__dict__],
-                best_video_id=vid, best_title=title, best_score=None, confidence="high")
+                best_video_id=vid, best_title=title, best_score=None, confidence="high",
+                latency_ms=url_state.get("meta_ms"),
+                chat_type=update.effective_chat.type if update.effective_chat else None)
             await incr_usage(user.id, "urls")
             try:
                 await _send_track(update, context, q.message, media_svc, query_id, 0,
@@ -2283,6 +2300,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.chat_data["video_busy"] = time.time()
             quality = data[2].rstrip("p") if len(data) >= 4 else "720"
             quality = f"{quality}p"
+            # a queries row for the URL-video path too, so dl_video events link
+            # to a query (funnel conversion) like the audio path does
+            try:
+                _vqid = await insert_query(
+                    user_id=user.id, correlation_id=uuid4().hex,
+                    description=f"url-video: {title}", intent="direct_url",
+                    signals=None, queries=[url], candidates=None,
+                    best_video_id=vid, best_title=title, best_score=None,
+                    confidence="high", latency_ms=url_state.get("meta_ms"),
+                    chat_type=update.effective_chat.type if update.effective_chat else None)
+            except Exception:
+                _vqid = None
             try:
                 await q.edit_message_text(await _t(update.effective_user.id, "video_start",
                                               quality=quality, title=title[:50]))
@@ -2334,7 +2363,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await _send_with_slow_mode(_video_send, vstat,
                                                    update.effective_user.id)
                     await incr_usage(user.id, "videos")
-                    await insert_event(user_id=user.id, kind="dl_video", video_id=vid)
+                    await insert_event(user_id=user.id, kind="dl_video", video_id=vid,
+                                       query_id=_vqid)
                     try:
                         _mb = int(Path(path).stat().st_size / 1_048_576)
                         await incr_usage(user.id, "bytes_sent", _mb)

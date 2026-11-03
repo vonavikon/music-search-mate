@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS queries (
     auto_download INTEGER,
     ambiguous INTEGER,
     outcome TEXT,
-    latency_ms INTEGER
+    latency_ms INTEGER,
+    chat_type TEXT,
+    llm_model TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,6 +167,10 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     # limit/error/ssrf) + latency; historical rows = ok (found and logged)
     await _add_col("queries", "outcome", "TEXT")
     await _add_col("queries", "latency_ms", "INTEGER")
+    # Analytics 2.0: where the query came from (private/group/supergroup) and
+    # which LLM ran it (model comparison on live traffic)
+    await _add_col("queries", "chat_type", "TEXT")
+    await _add_col("queries", "llm_model", "TEXT")
     await db.execute("UPDATE queries SET outcome='ok' WHERE outcome IS NULL")
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_user_time ON events(user_id, created_at)")
@@ -194,6 +200,8 @@ async def insert_query(
     ambiguous: bool | None = None,
     outcome: str = "ok",
     latency_ms: int | None = None,
+    chat_type: str | None = None,
+    llm_model: str | None = None,
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -201,8 +209,9 @@ async def insert_query(
                (created_at, user_id, correlation_id, description, intent,
                 signals_json, queries_json, candidates_json,
                 best_video_id, best_title, best_score, confidence,
-                match_score, auto_download, ambiguous, outcome, latency_ms)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                match_score, auto_download, ambiguous, outcome, latency_ms,
+                chat_type, llm_model)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time(), user_id, correlation_id, description, intent,
                 json.dumps(signals, ensure_ascii=False) if signals else None,
@@ -213,6 +222,7 @@ async def insert_query(
                 None if auto_download is None else int(auto_download),
                 None if ambiguous is None else int(ambiguous),
                 outcome, latency_ms,
+                chat_type, llm_model,
             ),
         )
         await db.commit()

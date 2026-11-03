@@ -59,19 +59,25 @@ def is_ambiguous(candidates: list, best_index: int, confidence: str) -> bool:
     where several versions of the same title are equally likely and a guess would
     serve the wrong one.
 
-    candidates is the ranked list (by LLM score); best_index is the LLM's pick;
-    runner-up is the max match_score among the rest. When the LLM pick disagrees
-    with the rule-based score (another candidate scores higher), that is also a
-    disagreement signal → preview."""
+    candidates is the ranked list (by LLM score); best_index is the LLM's pick.
+    The runner-up only counts when it is a DIFFERENT track (track_key): duplicate
+    uploads of the same song (Official/Topic/VEVO of the same recording) all
+    serve the user equally well, so equal scores among them are confidence, not
+    ambiguity. A higher-scoring different track is still a disagreement
+    signal → preview (negative gap < AMBIGUITY_GAP)."""
     if confidence == "low":
         return True
     if not candidates or not (0 <= best_index < len(candidates)):
         return False
     best = candidates[best_index]
+    key = track_key(best)
     rest = [c for i, c in enumerate(candidates) if i != best_index]
     if not rest:
         return False
-    runner_up = max(rest, key=lambda c: getattr(c, "match_score", 0.0))
+    others = [c for c in rest if track_key(c) != key]
+    if not others:
+        return False
+    runner_up = max(others, key=lambda c: getattr(c, "match_score", 0.0))
     return (best.match_score - runner_up.match_score) < AMBIGUITY_GAP
 
 
@@ -108,6 +114,25 @@ def _clean_title(t: str) -> str:
     t = _NOISE_TAIL.sub("", t or "")
     t = _EMPTY_PARENS.sub("", t)
     return t.strip(" -–—|")
+
+
+def track_key(candidate) -> str:
+    """Identity of the underlying track for duplicate detection.
+
+    YouTube carries several uploads of the same song (Official video, Topic
+    auto-channel, VEVO, lyric videos): they all answer the query equally, so
+    they must not look like ambiguity. Key = normalized cleaned title; when
+    the title carries no "artist - track" separator (Topic uploads often put
+    the artist only in the channel), the channel (minus "- Topic") is folded
+    in. Imperfect by design: a rare false "different" only falls back to a
+    top-3 preview, which is safe.
+    """
+    title = _clean_title(getattr(candidate, "title", "") or "")
+    key = _norm(title)
+    if " - " not in (title or ""):
+        ch = re.sub(r"\s*[-–—]\s*topic\s*$", "", getattr(candidate, "channel", "") or "", flags=re.I)
+        key = _norm(f"{ch} {title}")
+    return key
 
 
 def _artist_score(channel: str, title: str, target_artist: str) -> tuple[float, str]:

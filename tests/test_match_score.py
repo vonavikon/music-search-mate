@@ -179,26 +179,32 @@ class TestShouldAutoDownload:
 
 
 class TestIsAmbiguous:
-    def _c(self, score) -> Candidate:
+    # Since Analytics 2.0 the runner-up only counts when it is a DIFFERENT
+    # track (track_key); the fixtures below spell out distinct tracks.
+    def _c(self, score, title="T", channel="C") -> Candidate:
         c = _c()
+        c.title = title
+        c.channel = channel
         c.match_score = score
         return c
 
     def test_confidence_low_always_ambiguous(self):
-        cands = [self._c(0.90), self._c(0.20)]
+        cands = [self._c(0.90, "A - X", "A"), self._c(0.20, "B - Y", "B")]
         assert is_ambiguous(cands, 0, "low") is True
 
     def test_clear_gap_not_ambiguous(self):
-        cands = [self._c(0.95), self._c(0.50)]
+        cands = [self._c(0.95, "A - X", "A"), self._c(0.50, "B - Y", "B")]
         assert is_ambiguous(cands, 0, "high") is False
 
     def test_tight_gap_ambiguous(self):
-        # "Yesterday" without an artist: top1 and top2 are nearly equal -> offer a choice of versions instead of guessing
-        cands = [self._c(0.72), self._c(0.70)]
+        # "Yesterday" without an artist: DIFFERENT recordings of nearly equal
+        # score -> offer a choice of versions instead of guessing
+        cands = [self._c(0.72, "The Beatles - Yesterday", "The Beatles"),
+                 self._c(0.70, "Elvis Presley - Yesterday", "Elvis Presley")]
         assert is_ambiguous(cands, 0, "medium") is True
 
     def test_gap_exactly_threshold(self):
-        cands = [self._c(0.80), self._c(0.72)]  # gap == 0.08 -> NOT ambiguous (>= threshold)
+        cands = [self._c(0.80, "A - X", "A"), self._c(0.72, "B - Y", "B")]  # gap == 0.08 -> NOT ambiguous
         assert is_ambiguous(cands, 0, "high") is False
 
     def test_single_candidate_not_ambiguous(self):
@@ -208,8 +214,9 @@ class TestIsAmbiguous:
         assert is_ambiguous([], -1, "high") is False
 
     def test_runner_up_is_higher_than_best(self):
-        # the LLM pick (index 0) disagrees with rule-based scoring: another candidate has a higher match_score -> preview
-        cands = [self._c(0.55), self._c(0.80)]
+        # the LLM pick (index 0) disagrees with rule-based scoring: a DIFFERENT
+        # track has a higher match_score -> preview
+        cands = [self._c(0.55, "A - X", "A"), self._c(0.80, "B - Y", "B")]
         assert is_ambiguous(cands, 0, "high") is True
 
 
@@ -229,3 +236,71 @@ def test_guest_vocalist_version_penalized():
     orig = score_candidate(Orig(), t, "this_track", 0.80)
     assert any("title-extra" in x for x in axl.reasons)
     assert orig.score > axl.score + 0.2
+
+
+class _Dup:
+    """A YouTube upload of a track: match_score is set manually."""
+
+    def __init__(self, title, channel, score):
+        self.title = title
+        self.channel = channel
+        self.match_score = score
+
+
+class TestSameTrackAmbiguity:
+    """Analytics 2.0: duplicates of the SAME track are not ambiguity.
+
+    Production 03.11: 10/10 over-threshold queries got ambiguous=True and
+    auto-download never fired, because Official/Topic/VEVO uploads of the
+    same song all score ~0.85 with gap 0.00-0.05. Whichever wins, the user
+    gets the right song — only a DIFFERENT close track should force a
+    top-3 preview."""
+
+    def test_same_track_duplicates_not_ambiguous(self):
+        cands = [
+            _Dup("Scorpions - Wind of Change", "ScorpionsVEVO", 0.85),
+            _Dup("Scorpions - Wind of Change (Official Video)", "Scorpions", 0.85),
+            _Dup("Scorpions - Wind of Change", "Scorpions - Topic", 0.85),
+        ]
+        assert is_ambiguous(cands, 0, "high") is False
+
+    def test_rule_vs_llm_disagreement_same_track_not_ambiguous(self):
+        # the LLM pick scores lower than another upload of the same song
+        cands = [
+            _Dup("Scorpions - Wind of Change", "Scorpions - Topic", 0.85),
+            _Dup("Scorpions - Wind of Change [HD]", "ScorpionsVEVO", 0.95),
+        ]
+        assert is_ambiguous(cands, 0, "high") is False
+
+    def test_different_close_track_is_ambiguous(self):
+        cands = [
+            _Dup("Scorpions - Wind of Change", "Scorpions", 0.85),
+            _Dup("Scorpions - Send Me an Angel", "Scorpions", 0.84),
+        ]
+        assert is_ambiguous(cands, 0, "high") is True
+
+    def test_different_higher_track_is_ambiguous(self):
+        # a different track outranks the LLM pick: disagreement -> preview
+        cands = [
+            _Dup("Scorpions - Wind of Change", "Scorpions", 0.85),
+            _Dup("Scorpions - Still Loving You", "Scorpions", 0.95),
+        ]
+        assert is_ambiguous(cands, 0, "high") is True
+
+    def test_low_confidence_always_ambiguous(self):
+        cands = [_Dup("A - X", "A", 0.95)]
+        assert is_ambiguous(cands, 0, "low") is True
+
+    def test_single_candidate_not_ambiguous(self):
+        cands = [_Dup("A - X", "A", 0.90)]
+        assert is_ambiguous(cands, 0, "high") is False
+
+    def test_over_threshold_duplicates_auto_download(self):
+        # the actual production scenario: duplicates over the threshold now
+        # reach should_auto_download AND pass the ambiguity gate
+        cands = [
+            _Dup("Scorpions - Wind of Change", "Scorpions", 0.85),
+            _Dup("Scorpions - Wind of Change", "Scorpions - Topic", 0.85),
+        ]
+        assert should_auto_download("this_track", 0.85) is True
+        assert is_ambiguous(cands, 0, "high") is False
