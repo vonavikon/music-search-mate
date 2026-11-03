@@ -1359,6 +1359,7 @@ async def _handle_url(update, context, media, user, url, desc):
     # state for callback handling
     context.chat_data[f"url:{vid}"] = {
         "url": url, "title": title,
+        "channel": meta.get("channel") or "",
         "meta_ms": int((time.monotonic() - _t_meta0) * 1000),
     }
 
@@ -2243,7 +2244,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(f"🎵 Качаю аудио: {title[:60]}…")
             except Exception:
                 pass
-            cand = Candidate(vid, title, "", 0, 0)
+            cand = Candidate(vid, title, url_state.get("channel") or "", 0, 0)
             cand.url = url
             query_id = await insert_query(
                 user_id=user.id, correlation_id=uuid4().hex,
@@ -2252,6 +2253,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 best_video_id=vid, best_title=title, best_score=None, confidence="high",
                 latency_ms=url_state.get("meta_ms"),
                 chat_type=update.effective_chat.type if update.effective_chat else None)
+            # State for the "Похожее" button on URL tracks: without it the sim
+            # callback hits search_cold ("Тот поиск уже остыл") — the URL path
+            # used to insert the query row but never the callback state.
+            await _save_state(context, query_id, {
+                "candidates": [cand], "confidence": "high",
+                "best_index": 0, "verdict": "", "intro": "",
+                "desc": f"url: {title}", "rejected_ids": [],
+                "intent": "direct_url", "reference": {}, "ts": time.time(),
+            })
+            context.chat_data["last_qid"] = query_id
             await incr_usage(user.id, "urls")
             try:
                 await _send_track(update, context, q.message, media_svc, query_id, 0,
