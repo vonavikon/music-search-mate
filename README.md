@@ -18,9 +18,10 @@ Full quality video: [demo.mp4](assets/demo.mp4)
 ```text
 [user description]      free-form text, any language
         ↓
-[LLM #1: extract]       intent (this_track / similar / from_source) + search queries;
-                        destructive requests (drugs, weapons, violence, self-harm,
-                        extremism) are cut here and by a regex prefilter before the LLM
+[LLM #1: extract]       intent (this_track / similar / mood / from_source /
+                        surprise) + search queries; destructive requests (drugs,
+                        weapons, violence, self-harm, extremism) are cut here
+                        and by a regex prefilter before the LLM
         ↓
 [youtube search]        yt-dlp runs the queries in parallel, ~20 raw candidates
         ↓
@@ -34,6 +35,8 @@ Full quality video: [demo.mp4](assets/demo.mp4)
 [download]              audio as a tagged file with embedded artwork; video in background
 ```
 
+Behind that common spine, the tail of the flow is split by intent: a router (`services/pipelines`, `route(intent)`) hands the extracted intent to its own pipeline. this_track gets a fuzzy confident-match shortcut that can skip the rank call, and superlative asks ("their first single") are fact-resolved through the web-grounded model before search; similar injects Last.fm neighbors of the reference into the queries and bans the reference itself from the results; mood builds candidate pools from real Last.fm tag charts instead of pure LLM guesses; from_source resolves the source with a web-grounded question, and "something like that song" markers switch it into similar mode; surprise picks deterministically, without a second LLM call, from the neighbors of the artists you previously marked as a hit. Unknown intents fall back to the legacy single pipeline that used to serve everything.
+
 - **Similar searches.** The reference track is resolved through Last.fm `track.search` into a canonical artist, its neighbors (`getSimilar`) are injected into the search queries, and the reference itself is banned from the results.
 - **Feedback loop.** A "miss" tap remembers the rejected candidate and offers the next one; the follow-up search excludes what you already turned down.
 - **Moderation that survives tricks.** The request text is normalized before any check: NFKC plus folding of Latin and Cyrillic homoglyph lookalikes in both directions, so obfuscated spellings and prompt injections do not slip through.
@@ -46,9 +49,14 @@ Full quality video: [demo.mp4](assets/demo.mp4)
 - **Tagged audio:** sent as a file with canonical artist/title/album tags and embedded album artwork (iTunes artwork when available, video thumbnail as fallback). The download path prefers native AAC in m4a, remuxes without re-encoding when possible, falls back to mp3 320k.
 - **Track card:** artwork, canonical artist, short bio, "hit / miss" buttons.
 - **Track facts:** the 💡 button fetches one web-grounded fact about the track via Perplexity sonar, cached for 30 days; repeated taps are free.
+- **Studio first:** live and concert recordings rank below studio versions; a live take only tops the list when no studio recording exists.
+- **No repeats:** "more like this" avoids re-serving tracks delivered recently, even when the same song resurfaces under a fan-channel cover; when nothing fresh is trustworthy, the bot honestly repeats the strong pick instead of digging up tail junk.
+- **"Surprise me" stays a surprise:** the request always means "play something unexpected"; the previous track's context never quietly turns it into "more like the last one".
+- **Clean verdict cards:** the model's verdict is facts about the artist and the track; a sanitizer strips invented advice (file-tag tips and the like) at every render point.
 - **Caches:** Telegram file_id (a track sent before is re-sent without downloading again), fact cache, similar pools, Last.fm lookups with a TTL.
 - **Groups:** the bot reacts only to @mentions (privacy mode off plus an explicit gate in code); per-user limits apply everywhere. Groups with Telegram slow mode are handled: the bot waits out the window once (up to 45 s, with a status note) and, if Telegram still refuses, tells the admins plainly instead of burning through candidates.
 - **Graceful degradation:** when the LLM gateway is down, the bot says so ("the AI is unavailable for a moment, going the simple way for now") and shows a pick-list of raw search results instead of silently auto-sending whatever the search topped with; one 5xx costs one attempt, not three.
+- **Prompt-injection gates:** known manipulation phrasings ("ignore previous instructions" and RU equivalents, attempts smuggled through the "not it:" restart channel) are cut before the first LLM call, so an attack costs zero model calls; a separate prefilter stops destructive how-to requests dressed as song searches. The hostile-input battery (prompt extraction, evasions, injections) is part of the test suite.
 - **Localization:** RU/EN for errors, statuses, buttons, and the clarifying questions the LLM asks; switch with /lang.
 - **Limits, in pieces not gigabytes:** 20 requests per hour per user, 100 searches a day on the live instance (code default 200, set by env) and 30 videos per day, 2 facts per day (cache hits are free), plus global daily budgets for everyone.
 - **Honest progress:** a percent progress bar (updates roughly every 3% / 1.2 s) and a separate "preparing file" stage while the file is converted, tagged, and uploaded.
@@ -69,12 +77,12 @@ cp .env.example .env
 Keys in `.env`:
 
 - `BOT_TOKEN`: token from @BotFather. Required.
-- `BOTHUB_API_KEY` + `BOTHUB_BASE`: any OpenAI-compatible gateway. One model extracts and ranks (`LLM_MODEL`), another does web-grounded facts (`LLM_MODEL_SONAR`, empty disables the fact layer).
+- `BOTHUB_API_KEY` + `BOTHUB_BASE`: any OpenAI-compatible gateway. One model extracts and ranks (`LLM_MODEL`), another does web-grounded facts (`LLM_MODEL_SONAR`, empty disables the fact layer). `LLM_MODEL_PIPELINES` optionally sets a different chat model per intent (this_track / similar / mood / from_source / surprise); extraction always runs on `LLM_MODEL`, since the intent only exists after it answers.
 - `LASTFM_API_KEY`: optional; without it the Last.fm layer is skipped gracefully.
 - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST`: optional tracing; without keys tracing is off.
 - `TG_API_ID` / `TG_API_HASH` / `LOCAL_BOT_API_URL`: optional local Bot API server for files up to 2 GB (your own app credentials from my.telegram.org). Without it the 50 MB cloud limit applies. When switching a bot to the local server for the first time, call `logOut` against api.telegram.org once, or updates keep going to the cloud.
 
-Tests: 301 tests, all offline against mocks, no network needed.
+Tests: 612 tests, all offline against mocks, no network needed. Beyond the unit suite, a scenario acceptance runner replays 35 scripted scenarios against the live gateway, 12 of them a hostile security battery (prompt injections, homoglyph and spaced-out evasions).
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -101,6 +109,9 @@ bot/
 services/
   llm_search.py               LLM #1 (extract) and LLM #2 (rank), moderation block,
                               similar-reference resolve via Last.fm
+  pipelines/                  intent pipelines: route(intent) registry; this_track /
+                              similar / mood / from_source / surprise each own the
+                              post-extract tail, legacy pipeline is the fallback
   search.py                   yt-dlp metadata search without downloading
                               (YouTube first, SoundCloud as fallback)
   media.py                    audio/video download via yt-dlp subprocess, live progress,
@@ -112,12 +123,12 @@ services/
   observability.py            circuit breaker for upstreams, PII redaction in logs
   tracing.py                  optional Langfuse tracing, one trace per search
 config.py                     env config: models, limits, allowlists, retention
-tests/                        301 tests, offline mocks, pytest
+tests/                        612 tests, offline mocks, pytest
 ```
 
 ## Status
 
-A pet project with one maintainer. Version 1.17 (November 2026); the public instance runs this code.
+A pet project with one maintainer. Version 1.20 (November 2026); the public instance runs this code.
 
 The project grew from real usage, not a roadmap: slowed-down and sped-up upload variants were breaking tags and artwork until the candidate filter learned to drop them; group mode was rebuilt after complaints from live group chats; the local Bot API server appeared when the 50 MB cloud ceiling became the actual limit.
 

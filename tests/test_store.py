@@ -161,6 +161,169 @@ async def test_recent_context_miss(store_db):
     assert ctx[0]["description"] == "мимо"
 
 
+class _Clock:
+    """Deterministic created_at source: every time.time() call advances by
+    1s, so 'newest first' ordering in get_user_hit_artists is test-stable
+    (real time.time() can tie on rapid inserts)."""
+
+    def __init__(self):
+        self._t = 1000.0
+
+    def time(self) -> float:
+        self._t += 1.0
+        return self._t
+
+
+async def _add_feedback_hit(qid: int, title: str, user_id: int = 42) -> None:
+    await store.insert_feedback(
+        query_id=qid, user_id=user_id, video_id=f"vid-{title}",
+        title=title, feedback="hit", shown_rank=0,
+    )
+
+
+async def test_get_user_hit_artists_parsed_deduped_newest_first(store_db, monkeypatch):
+    """hit rows -> artists parsed from 'Artist - Track' titles, NEWEST first,
+    deduped preserving order (a repeated artist does not re-enter the list)."""
+    await store.init_db()
+    monkeypatch.setattr(store, "time", _Clock())
+    qid = await store.insert_query(**_insert_kwargs(
+        correlation_id="corr-hits", description="история попаданий"))
+
+    await _add_feedback_hit(qid, "Kino - Gruppa Krovi")       # oldest hit
+    await _add_feedback_hit(qid, "Molchat Doma - Sudno")
+    await _add_feedback_hit(qid, "Kino - Zvezda")             # dup artist, newest
+
+    assert await store.get_user_hit_artists(user_id=42) == ["Kino", "Molchat Doma"]
+
+
+async def test_get_user_hit_artists_ignores_miss_and_unparsable(store_db, monkeypatch):
+    """'miss' feedback rows never enter the pool; titles without the
+    'Artist - Track' shape parse to '' and are skipped."""
+    await store.init_db()
+    monkeypatch.setattr(store, "time", _Clock())
+    qid = await store.insert_query(**_insert_kwargs(
+        correlation_id="corr-miss", description="смешанная история"))
+
+    await store.insert_feedback(
+        query_id=qid, user_id=42, video_id="v-miss",
+        title="Molchat Doma - Sudno", feedback="miss", shown_rank=0)
+    await _add_feedback_hit(qid, "Bare Title No Dash")
+    await _add_feedback_hit(qid, "Zemfira - Zhivi")
+
+    assert await store.get_user_hit_artists(user_id=42) == ["Zemfira"]
+
+
+async def test_get_user_hit_artists_empty(store_db):
+    """No feedback at all (a new user) -> []."""
+    await store.init_db()
+
+    assert await store.get_user_hit_artists(user_id=42) == []
+
+
+# ════ stale-hit fallback: hit titles without "Artist - Track" (live 2026-11-05) ════
+
+async def test_get_user_hit_artists_fallback_to_linked_query_candidates(
+        store_db, monkeypatch):
+    """Live 2026-11-05 stale hits: today's hits stored as bare titles
+    ('King of Dreams', no dash split) used to drop out of the taste pool.
+    The artist now falls back to the LINKED query's stored candidate
+    channel: candidates_json entry matching the feedback video_id, minus
+    ' - Topic' -> 'Deep Purple'. A parsable title still wins over the
+    channel (a label channel must not steal attribution)."""
+    await store.init_db()
+    monkeypatch.setattr(store, "time", _Clock())
+    qid = await store.insert_query(**_insert_kwargs(
+        correlation_id="corr-today", description="сегодняшние хиты",
+        candidates=[
+            {"video_id": "v-kod", "title": "King of Dreams",
+             "channel": "Deep Purple - Topic", "duration": 280, "views": 1_000},
+            {"video_id": "v-coc", "title": "Cocaine",
+             "channel": "JJ Cale - Topic", "duration": 250, "views": 2_000},
+        ],
+        best_video_id="v-kod", best_title="King of Dreams",
+        best_score=0.9, confidence="high",
+    ))
+    qid2 = await store.insert_query(**_insert_kwargs(
+        correlation_id="corr-parsable", description="старый хит с тире",
+        candidates=[{"video_id": "v-old", "title": "Kino - Gruppa Krovi",
+                     "channel": "Some Label Channel", "duration": 200, "views": 5}],
+        best_video_id="v-old", best_title="Kino - Gruppa Krovi",
+        best_score=0.9, confidence="high",
+    ))
+
+    # newest first: the dash-less hit resurrects Deep Purple via the
+    # video_id match into candidates_json; the parsable title wins over
+    # its label channel
+    await store.insert_feedback(
+        query_id=qid, user_id=42, video_id="v-kod",
+        title="King of Dreams", feedback="hit", shown_rank=0)
+    await _add_feedback_hit(qid2, "Kino - Gruppa Krovi")
+
+    artists = await store.get_user_hit_artists(user_id=42)
+    assert artists == ["Kino", "Deep Purple"]
+
+
+async def test_get_user_hit_artists_fallback_pointer_variants(store_db, monkeypatch):
+    """Fallback pointer variants: the feedback video_id leads; when it is
+    absent from the stored blob the shown_rank index attributes instead;
+    a NULL/corrupt candidates blob or an out-of-range rank keeps the row
+    skipped (the pre-fallback behavior)."""
+    await store.init_db()
+    monkeypatch.setattr(store, "time", _Clock())
+    qid = await store.insert_query(**_insert_kwargs(
+        correlation_id="corr-rank", description="ранк-фолбэк",
+        candidates=[
+            {"video_id": "v-a", "title": "Track A", "channel": "Artist A - Topic",
+             "duration": 100, "views": 1},
+            {"video_id": "v-b", "title": "Track B", "channel": "Artist B - Topic",
+             "duration": 100, "views": 1},
+        ],
+        best_video_id="v-b", best_title="Track B", best_score=0.9, confidence="high",
+    ))
+    # video_id unknown to the blob -> shown_rank=1 picks candidates[1]
+    await store.insert_feedback(
+        query_id=qid, user_id=42, video_id="v-gone", title="Taxi 2 (La course)",
+        feedback="hit", shown_rank=1)
+    assert await store.get_user_hit_artists(user_id=42) == ["Artist B"]
+
+    # corrupt blob and out-of-range rank -> row skipped, no crash
+    qid2 = await store.insert_query(**_insert_kwargs(
+        correlation_id="corr-junk", description="битый блоб",
+        candidates="not-json",
+        best_video_id="v-x", best_title="Cocaine", best_score=0.9, confidence="high",
+    ))
+    await store.insert_feedback(
+        query_id=qid2, user_id=42, video_id="v-y", title="Cocaine",
+        feedback="hit", shown_rank=99)
+    assert await store.get_user_hit_artists(user_id=42) == ["Artist B"]
+
+
+async def test_get_recent_best_titles(store_db, monkeypatch):
+    """The delivered-titles lookback for the surprise exclusion (live F5):
+    newest first (id DESC), NULL/empty titles skipped, other users ignored,
+    limit honored."""
+    await store.init_db()
+    monkeypatch.setattr(store, "time", _Clock())
+    for i, title in enumerate(["Old Track", None, "Mid Track", "  "]):
+        await store.insert_query(**_insert_kwargs(
+            correlation_id=f"corr-bt-{i}", description=f"запрос {i}",
+            best_title=title))
+    await store.insert_query(**_insert_kwargs(  # another user's delivery
+        correlation_id="corr-bt-other", description="чужой",
+        user_id=7, best_title="Someone Else - Track"))
+    await store.insert_query(**_insert_kwargs(
+        correlation_id="corr-bt-new", description="новейший",
+        best_video_id="v9", best_title="Dave Gahan - Tomorrow",
+        best_score=0.5, confidence="medium"))
+
+    assert await store.get_recent_best_titles(user_id=42) == \
+        ["Dave Gahan - Tomorrow", "Mid Track", "Old Track"]
+    assert await store.get_recent_best_titles(user_id=42, limit=2) == \
+        ["Dave Gahan - Tomorrow", "Mid Track"]
+    assert await store.get_recent_best_titles(user_id=7) == ["Someone Else - Track"]
+    assert await store.get_recent_best_titles(user_id=99) == []
+
+
 async def test_upsert_and_get_session(store_db):
     await store.init_db()
 

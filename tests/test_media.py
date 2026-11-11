@@ -40,7 +40,7 @@ async def test_extract_url_meta_clean_url(media):
     assert result["channel"] == "Test Artist"
 
     cmd = mock_exec.call_args[0]
-    assert "yt-dlp" in cmd
+    assert cmd[0].endswith("yt-dlp")  # venv binary resolved deterministically
     assert "--dump-json" in cmd
 
 
@@ -114,7 +114,7 @@ async def test_download_audio_success(media, tmp_path, monkeypatch):
             m4a_path, thumb_path, info = await media.download_audio(url)
 
     cmd = mock_exec.call_args[0]
-    assert "yt-dlp" in cmd
+    assert cmd[0].endswith("yt-dlp")  # venv binary resolved deterministically
     assert "--extract-audio" in cmd
     assert "--audio-format" in cmd
     assert "m4a" in cmd
@@ -241,3 +241,146 @@ def test_cleanup_temp_recursive(monkeypatch, tmp_path):
     assert not f1.exists() and not nested.exists()   # stale content removed along with its directory
     assert f2.exists()                                # fresh download untouched
     assert n >= 2
+
+
+# ════ F6: video quality selection ════
+
+def test_video_format_per_quality():
+    """The -f selector is built per quality; 'best' keeps today's cascade."""
+    from services.media import video_format
+    assert video_format("240") == (
+        "bv*[height<=240][ext=mp4]+ba[ext=m4a]"
+        "/bv*[height<=240]+ba"
+        "/b[height<=240]")
+    assert video_format("360") == (
+        "bv*[height<=360][ext=mp4]+ba[ext=m4a]"
+        "/bv*[height<=360]+ba"
+        "/b[height<=360]")
+    assert video_format("480") == (
+        "bv*[height<=480][ext=mp4]+ba[ext=m4a]"
+        "/bv*[height<=480]+ba"
+        "/b[height<=480]")
+    assert video_format("360p") == video_format("360")  # old dl:q style tolerated
+    assert video_format("best") == (
+        "best[height<=720][ext=mp4]"
+        "/bestvideo[height<=720]+bestaudio"
+        "/best[height<=720]"
+        "/best[ext=mp4]/best")
+
+
+def test_video_format_legacy_heights_keep_cascade():
+    """720/1080/1440 (old dl:q buttons) keep the height-capped legacy cascade."""
+    from services.media import video_format
+    assert video_format("1080") == (
+        "best[height<=1080][ext=mp4]"
+        "/bestvideo[height<=1080]+bestaudio"
+        "/best[height<=1080]"
+        "/best[ext=mp4]/best")
+    assert video_format("720") == video_format("best")
+
+
+@pytest.mark.asyncio
+async def test_download_video_default_quality_and_args(media, tmp_path, monkeypatch):
+    """Default call: 360p selector, mp4 merge, socket timeout, 50M size cap,
+    and the chosen label comes back in info."""
+    from services.media import video_format
+    monkeypatch.setattr("services.media.TEMP_DIR", tmp_path)
+    monkeypatch.delenv("VIDEO_MAX_FILESIZE", raising=False)
+
+    vid = "dQw4w9WgXcQ"
+    url = f"https://www.youtube.com/watch?v={vid}"
+    fake_mp4 = tmp_path / f"{vid}.mp4"
+    fake_mp4.write_bytes(b"v")
+    fake_info = tmp_path / f"{vid}.info.json"
+    fake_info.write_text(json.dumps({"id": vid, "title": "Test"}))
+
+    proc = AsyncMock()
+    proc.returncode = 0
+    proc.communicate.return_value = (b"", b"")
+
+    with patch("pathlib.Path.iterdir", return_value=[fake_mp4, fake_info]):
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            path, info = await media.download_video(url)
+
+    cmd = mock_exec.call_args[0]
+    # the media-layer signature default is 360 (the handler always passes the
+    # height picked in the quality picker)
+    assert cmd[cmd.index("-f") + 1] == video_format("360")
+    assert cmd[cmd.index("--merge-output-format") + 1] == "mp4"
+    assert "--socket-timeout" in cmd
+    assert cmd[cmd.index("--max-filesize") + 1] == "50M"
+    assert path.endswith(".mp4")
+    assert info["chosen_quality"] == "360"
+
+
+@pytest.mark.asyncio
+async def test_download_video_oversize_steps_down(media, tmp_path, monkeypatch):
+    """A merged file over ~48MB at 480p retries one step lower (360p); the
+    oversized directory is dropped immediately."""
+    from services.media import video_format
+    monkeypatch.setattr("services.media.TEMP_DIR", tmp_path)
+    monkeypatch.delenv("VIDEO_MAX_FILESIZE", raising=False)
+
+    vid = "bigvideo0001"
+    url = f"https://www.youtube.com/watch?v={vid}"
+    run1 = tmp_path / "run1"
+    run2 = tmp_path / "run2"
+    run1.mkdir()
+    run2.mkdir()
+    big = run1 / "v.mp4"
+    with open(big, "wb") as f:
+        f.truncate(49 * 1024 * 1024)  # sparse: st_size 49MB, no real disk cost
+    small = run2 / "v.mp4"
+    small.write_bytes(b"v")
+    info1 = run1 / "v.info.json"
+    info1.write_text(json.dumps({"id": vid}))
+    info2 = run2 / "v.info.json"
+    info2.write_text(json.dumps({"id": vid}))
+
+    proc = AsyncMock()
+    proc.returncode = 0
+    proc.communicate.return_value = (b"", b"")
+
+    with patch("pathlib.Path.iterdir", side_effect=[[big, info1], [small, info2]]):
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            path, info = await media.download_video(url, "480")
+
+    assert Path(path).name == "v.mp4"
+    assert path == str(small)
+    assert info["chosen_quality"] == "360"
+    fmts = []
+    for c in mock_exec.call_args_list:
+        cmd = c[0]
+        fmts.append(cmd[cmd.index("-f") + 1])
+    assert fmts == [video_format("480"), video_format("360")]
+    assert not run1.exists()  # the oversized dir doesn't wait for TTL cleanup
+
+
+@pytest.mark.asyncio
+async def test_download_video_oversize_at_240_raises(media, tmp_path, monkeypatch):
+    """Chain bottom reached while still over the guard: refuse instead of
+    delivering a file Telegram would reject."""
+    monkeypatch.setattr("services.media.TEMP_DIR", tmp_path)
+    monkeypatch.delenv("VIDEO_MAX_FILESIZE", raising=False)
+
+    vid = "hugevideo001"
+    url = f"https://www.youtube.com/watch?v={vid}"
+    run1 = tmp_path / "run1"
+    run1.mkdir()
+    big = run1 / "v.mp4"
+    with open(big, "wb") as f:
+        f.truncate(49 * 1024 * 1024)
+    info1 = run1 / "v.info.json"
+    info1.write_text(json.dumps({"id": vid}))
+
+    proc = AsyncMock()
+    proc.returncode = 0
+    proc.communicate.return_value = (b"", b"")
+
+    with patch("pathlib.Path.iterdir", side_effect=[[big, info1]]):
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            with pytest.raises(RuntimeError, match="even at 240p"):
+                await media.download_video(url, "240")
+
+    assert mock_exec.await_count == 1  # nothing below 240 in the chain
+    assert not run1.exists()

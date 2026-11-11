@@ -22,3 +22,7 @@ secrets/
 *.db
 .zcode/
 tmp/
+
+# local dev-bot launcher secrets (2026-11-04, dev bot testing)
+.env.dev
+.env.langfuse-dev

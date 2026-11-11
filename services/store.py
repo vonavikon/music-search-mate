@@ -4,6 +4,7 @@ Both a journal (observability) and a labeling dataset for rank improvement.
 Every search = a row in queries; every "hit/miss" feedback = a row in feedback.
 """
 import json
+import re
 import time
 import aiosqlite
 from config import DB_PATH, DATA_DIR
@@ -57,11 +58,11 @@ CREATE TABLE IF NOT EXISTS user_prefs (
 CREATE TABLE IF NOT EXISTS usage (
     user_id INTEGER NOT NULL,
     day TEXT NOT NULL,             -- YYYY-MM-DD
-    searches INTEGER DEFAULT 0,    -- LLM-поиски по описанию
-    urls INTEGER DEFAULT 0,        -- скачивания по ссылке (без LLM)
-    facts INTEGER DEFAULT 0,       -- sonar-факты по кнопке 💡 (заход 27)
-    videos INTEGER DEFAULT 0,      -- скачанные видео (заход 27)
-    bytes_sent INTEGER DEFAULT 0,  -- МБ отправленных файлов
+    searches INTEGER DEFAULT 0,    -- LLM searches by description
+    urls INTEGER DEFAULT 0,        -- link downloads (no LLM)
+    facts INTEGER DEFAULT 0,       -- sonar facts via the 💡 button (iteration 27)
+    videos INTEGER DEFAULT 0,      -- downloaded videos (iteration 27)
+    bytes_sent INTEGER DEFAULT 0,  -- MB of files sent
     updated_at REAL NOT NULL,
     PRIMARY KEY (user_id, day)
 );
@@ -75,7 +76,7 @@ CREATE TABLE IF NOT EXISTS wtp_survey (
     response_kind TEXT,            -- 'button' | 'free' | 'optout' | 'ignored'
     stars_value REAL,
     free_text TEXT,
-    shown_count INTEGER DEFAULT 1  -- сколько раз показан (анти-спам)
+    shown_count INTEGER DEFAULT 1  -- how many times shown (anti-spam)
 );
 CREATE INDEX IF NOT EXISTS idx_wtp_user ON wtp_survey(user_id, created_at);
 CREATE TABLE IF NOT EXISTS sessions (
@@ -526,6 +527,103 @@ async def recent_context(user_id: int, limit: int = 3, window_min: int = 30) -> 
             "outcome": outcome,
         })
     return out
+
+
+def _artist_from_title(title: str | None) -> str:
+    """Artist part of a stored "Artist - Track" title ('' when unparsable).
+
+    Splits on the FIRST " - " only; a length guard (artist 1..80 chars, a
+    non-empty track side) keeps dash-inside-song titles and junk rows from
+    feeding garbage artists into the surprise pool."""
+    if not title:
+        return ""
+    head, sep, tail = title.partition(" - ")
+    artist = head.strip()
+    if not sep or not artist or not tail.strip():
+        return ""
+    if not (1 <= len(artist) <= 80):
+        return ""
+    return artist
+
+
+# YouTube Music auto-channels end in " - Topic" (en/em dash variants exist);
+# stripped wherever a stored channel is read as an artist name.
+_TOPIC_SUFFIX_RE = re.compile(r"\s*[-–—]\s*topic\s*$", re.I)
+
+
+def _artist_from_candidates_json(candidates_json: str | None,
+                                 video_id: str | None,
+                                 shown_rank: int | None) -> str:
+    """Artist for a "hit" whose stored title has no "Artist - Track" split
+    (live 2026-11-05: "King of Dreams"): the channel of the linked query's
+    delivered candidate from queries.candidates_json, minus the " - Topic"
+    suffix. The candidate is the one the feedback points at — the video_id
+    match first, the shown_rank index into the stored array as the fallback.
+    '' when the blob is missing/corrupt or neither pointer resolves (the row
+    is then simply skipped, same as before the fallback existed)."""
+    if not candidates_json:
+        return ""
+    try:
+        candidates = json.loads(candidates_json)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(candidates, list):
+        return ""
+    dicts = [c for c in candidates if isinstance(c, dict)]
+    entry = next((c for c in dicts if video_id and c.get("video_id") == video_id), None)
+    if entry is None and shown_rank is not None and 0 <= shown_rank < len(dicts):
+        entry = dicts[shown_rank]
+    channel = _TOPIC_SUFFIX_RE.sub("", str((entry or {}).get("channel") or "")).strip()
+    return channel if 1 <= len(channel) <= 80 else ""
+
+
+async def get_user_hit_artists(user_id: int, limit: int = 20) -> list[str]:
+    """Artists of the tracks the user marked "hit": feedback rows with
+    feedback='hit', newest first, parsed from the stored "Artist - Track"
+    titles, deduped preserving order, capped at `limit`. The personal taste
+    zone the surprise pipeline grows its neighbor pool from.
+
+    Robust parsing (live 2026-11-05, the stale-hits finding): a hit title
+    without the "Artist - Track" shape ("King of Dreams") used to silently
+    drop the artist, so the pool was built from OLD hits only. Such a row now
+    falls back to the LINKED query's delivered candidate channel
+    (queries.candidates_json via the feedback join, minus " - Topic") — one
+    SQL join, one json parse per unparsable row."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT f.title, f.video_id, f.shown_rank, q.candidates_json
+               FROM feedback f LEFT JOIN queries q ON q.id = f.query_id
+               WHERE f.user_id=? AND f.feedback='hit'
+               ORDER BY f.created_at DESC""",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    artists: list[str] = []
+    for title, video_id, shown_rank, candidates_json in rows:
+        artist = _artist_from_title(title)
+        if not artist:
+            artist = _artist_from_candidates_json(candidates_json, video_id, shown_rank)
+        if artist and artist not in artists:
+            artists.append(artist)
+            if len(artists) >= limit:
+                break
+    return artists
+
+
+async def get_recent_best_titles(user_id: int, limit: int = 20) -> list[str]:
+    """The user's most recently delivered track titles: queries.best_title,
+    newest first (id DESC), NULL/empty titles skipped. The surprise pipeline
+    excludes these from discovery (live 2026-11-05 F5): a pool re-served by
+    the search layer must not re-deliver a track the user just got."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT best_title FROM queries WHERE user_id=? "
+            "AND best_title IS NOT NULL AND TRIM(best_title)<>'' "
+            "ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [r[0] for r in rows]
 
 
 async def upsert_session(

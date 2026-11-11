@@ -6,12 +6,13 @@ Flow (updated per review 27c):
     [URL?] media.extract_url_meta -> Audio/Video buttons
     [else] recent_context -> search_candidates ->
       [clarify?] clarifying question (no download)
-      [else]    auto best -> download -> send (single+download path,
-                preview carousel removed)
+      [else]    auto best -> head-start download (in parallel with the card
+                render/send, single+download path, preview carousel removed)
   callback:
     fb:h/m (miss accumulates rejected_ids + the next candidate),
     sim: similar (pool cache or a new search), rn/rf/rfx: refinement,
-    dlv: video from a track, dl:aud/vid/q: download by link,
+    dlv: video from a track, dl:aud/vid/q: download by link (vid -> the quality
+    picker 240-1440, q: the picked height),
     fact: a track fact (sonar on demand, 30d cache, caps)
 """
 import asyncio
@@ -25,7 +26,8 @@ from html import escape
 from pathlib import Path
 from uuid import uuid4
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+                      BotCommand, BotCommandScopeChat)
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter
 from telegram.ext import ContextTypes
@@ -41,9 +43,10 @@ from services.store import (
     delete_query_state, cache_file, get_cached_file, get_query_correlation,
     update_cached_artwork, get_fact, save_fact,
 )
+from services import store as store_svc  # the module itself: passed into search_candidates (surprise history)
 from services.tracing import SearchTrace, score_feedback
 from services.metadata import MetaOut, pretty_title
-from services.media import cleanup_temp
+from services.media import cleanup_temp, _DEFAULT_VIDEO_QUALITY
 from services import tag_enrichment
 
 log = logging.getLogger("bot.handler")
@@ -78,6 +81,20 @@ def _denied(update: Update, context) -> bool:
         return False
     log.info("access denied: user=%s outside allowlist (%d id(s))",
              update.effective_user.id, len(ids))
+    return True
+
+
+def _not_owner(update: Update, context) -> bool:
+    """Owner-only commands (/stats): BOT_OWNER_ID. Unset (0) = no extra check
+    beyond the allowlist gate — same deliberate looseness as an empty list,
+    so test runs and old env files keep working."""
+    cfg = context.bot_data.get("cfg")
+    owner = getattr(cfg, "bot_owner_id", 0) or 0
+    if not owner or update.effective_user is None:
+        return False
+    if update.effective_user.id == owner:
+        return False
+    log.info("access denied: user=%s is not owner", update.effective_user.id)
     return True
 
 
@@ -125,6 +142,8 @@ _T = {
                        "en": "Couldn't read the link. Trying to understand the description…"},
     "dl_none": {"ru": "Не смог скачать ни один из вариантов. Попробуй позже или кинь ссылку.",
                 "en": "Couldn't download any of the variants. Try later or send a link."},
+    "dl_refused": {"ru": "Нашёл {title}, но YouTube сейчас не даёт его скачать. Попробуй ещё раз через минуту или пришли ссылку на этот трек.",
+                   "en": "Found {title}, but YouTube refuses to let me download it right now. Try again in a minute or send a direct link to this track."},
     "degraded_notice": {"ru": "Нейросеть что-то недоступна, пока пойду более простым путём.",
                         "en": "The AI is unavailable for a moment, going the simple way for now."},
     "slow_wait": {"ru": "Telegram просит подождать {sec} с из-за медленного режима группы, файл едет…",
@@ -216,6 +235,33 @@ async def _t(user_id, key: str, **fmt) -> str:
     d = _T.get(key) or {}
     s = d.get(await _lang_of(user_id)) or d.get("ru") or key
     return s.format(**fmt) if fmt else s
+
+
+# ---------- "/" command menu (inline command hints), RU/EN ----------
+# One source for both call sites: startup (bot/main.py registers both lists
+# on the default scope with language_code, the client picks by ITS interface
+# locale) and the language-choice callback (per-chat override, see kind=="lang"
+# in handle_callback). Fresh BotCommand objects per call: callers must not
+# share a mutable list.
+def bot_commands(lang: str) -> list[BotCommand]:
+    """Command menu for a language ("ru" default, like _lang_of)."""
+    ru = [
+        ("start", "найти трек по описанию или ссылке"),
+        ("help", "как искать и что значат кнопки"),
+        ("lang", "язык ответов"),
+        ("new", "начать поиск с чистого листа"),
+        ("stats", "цифры за сегодня"),
+        ("donate", "поддержать проект"),
+    ]
+    en = [
+        ("start", "find a track from a description or link"),
+        ("help", "how to search and what the buttons mean"),
+        ("lang", "answer language"),
+        ("new", "start a fresh search"),
+        ("stats", "today's numbers"),
+        ("donate", "support the project"),
+    ]
+    return [BotCommand(c, d) for c, d in (en if lang == "en" else ru)]
 
 
 
@@ -324,6 +370,57 @@ def _reply_keyboard(query_id: int, rank: int, keyboard: str, vid: str = "",
         rows.append([fact_btn])
     return InlineKeyboardMarkup(rows)
 
+
+# Video quality: the user ALWAYS picks the height explicitly in the picker
+# (the owner's original flow, restored) — no silent default download. The old
+# ladder was 480/720/1080/1440; 240/360 extend it at the bottom per the owner's
+# request ("вплоть до максимума, как это было" = RU "up to the maximum,
+# as it used to be").
+_VIDEO_QUALITY_LADDER = ("240", "360", "480", "720", "1080", "1440")
+
+
+def _video_quality_label(quality: str) -> str:
+    """'360'/'360p' -> '360p', 'best' -> 'HD'. Status/caption display only."""
+    q = (quality or "").strip().lower()
+    if q.endswith("p") and q[:-1].isdigit():
+        q = q[:-1]
+    return f"{q}p" if q.isdigit() else "HD"
+
+
+def _video_quality_picker(vid: str) -> InlineKeyboardMarkup:
+    """The quality picker for a video link / the dlv button: the full ladder
+    240-1440, two buttons per row, ascending (the layout the old picker used,
+    extended with the 240/360 row). Callbacks stay dl:q:{q}:{vid} — the same
+    contract the old messages already carry."""
+    rows = [
+        [InlineKeyboardButton(f"{_VIDEO_QUALITY_LADDER[i]}p",
+                              callback_data=f"dl:q:{_VIDEO_QUALITY_LADDER[i]}:{vid}"),
+         InlineKeyboardButton(f"{_VIDEO_QUALITY_LADDER[i + 1]}p",
+                              callback_data=f"dl:q:{_VIDEO_QUALITY_LADDER[i + 1]}:{vid}")]
+        for i in range(0, len(_VIDEO_QUALITY_LADDER), 2)
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+# Owner request (live session 06.11): NO post-delivery quality offers — a
+# delivered video file carries no keyboard. The quality UI is the picker
+# BEFORE the download (dl:q:{q}:{vid}); to re-quality the user asks again.
+# The old neighbor row (qvid:{vid}:{q} buttons + their callback handler) is
+# gone; qvid presses on messages delivered before this change fall through
+# unanswered.
+
+
+def _resolve_video_ref(context, vid: str):
+    """(url, title, state) for a video ref, or None when unrecoverable.
+    chat_data url:{vid} first; a restart loses it, but an 11-char YouTube id
+    is enough to rebuild the URL (the dl: buttons resolve the same way)."""
+    url_state = context.chat_data.get(f"url:{vid}")
+    if url_state:
+        return url_state["url"], url_state["title"], url_state
+    if vid and len(vid) == 11:
+        return f"https://www.youtube.com/watch?v={vid}", vid, {}
+    return None
+
 # URL fast-path: deterministic link detection BEFORE the LLM. Platform-agnostic —
 # catches any http(s) URL (YouTube, SoundCloud, Bandcamp, Yandex Music, ...);
 # yt-dlp deals with the platform. Strip trailing punctuation (a period/comma/
@@ -421,7 +518,7 @@ _LANG_MARKUP = InlineKeyboardMarkup([[
 # greeting word pool (the language is asked first; greet in that language)
 _GREETING_HELLOS = [
     # ONLY clean greetings in different languages (owner: no "Меломан, привет"
-    # or other add-ons); the language only picks the text that follows
+    # [RU "hi, music lover"] or other add-ons); language picks the text after
     "Привет!", "Здравствуй!", "Здравствуйте!", "Добрый день!", "Доброе утро!",
     "Добрый вечер!", "Приветствую!", "Салют!", "Хай!",
     "Hello!", "Hi!", "Hey!", "Hello there!", "Hey there!", "Hiya!",
@@ -464,6 +561,22 @@ def _mig_nova_payload(context) -> bool:
                for a in (getattr(context, "args", None) or []))
 
 
+async def _send_greeting(message, lang: str) -> None:
+    """The /start greeting: project picture + caption, text fallback.
+    Shared by /start itself and the language-selection callback (the owner's
+    prod report 2026-11-04: after choosing a language the greeting never
+    arrived — the callback only set a ✅ and returned, forcing a second
+    /start)."""
+    from telegram.constants import ParseMode as _PM
+    _img = Path(__file__).resolve().parent.parent / "assets" / "start.png"
+    if _img.exists():
+        with open(_img, "rb") as _ph:
+            await message.reply_photo(
+                photo=_ph, caption=_greeting(lang), parse_mode=_PM.HTML)
+        return
+    await message.reply_text(_greeting(lang), parse_mode=_PM.HTML)
+
+
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user  # fix: user was undefined here (NameError for guests)
     if _denied(update, context):
@@ -484,15 +597,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "На каком языке показывать справку о треках?\nWhat language for track info?",
             reply_markup=_LANG_MARKUP)
         return
-    from telegram.constants import ParseMode as _PM
-    # /start with the project picture (assets/start.png in the image)
-    _img = Path(__file__).resolve().parent.parent / "assets" / "start.png"
-    if _img.exists():
-        with open(_img, "rb") as _ph:
-            await update.message.reply_photo(
-                photo=_ph, caption=_greeting(lang), parse_mode=_PM.HTML)
-        return
-    await update.message.reply_text(_greeting(lang), parse_mode=_PM.HTML)
+    await _send_greeting(update.message, lang)
 
 
 async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -598,10 +703,80 @@ def _progress_bar(pct: float) -> str:
     return "\u2588" * filled + "\u2591" * (10 - filled)
 
 
+def _dl_progress_cb(status, user_id):
+    """Live download progress in the status message («⬇️ N%»). Shared by the
+    head-start download (started in _finish_search, before the card) and the
+    inline downloads of the non-best candidates."""
+    async def _cb(pct: float) -> None:
+        if status is None:
+            return
+        try:
+            await status.edit_text(await _t(user_id, "dl_bar",
+                                            bar=_progress_bar(pct), pct=int(pct)))
+        except Exception:
+            pass
+    return _cb
+
+
+class _HeadStart:
+    """A download started before the card is rendered/sent (UX latency fix,
+    owner complaint 04.11: the full download time used to sit between the card
+    and the audio). .fut is the download task; .done_at is set the moment it
+    settles (for the head-start observability logs)."""
+
+    __slots__ = ("fut", "done_at")
+
+    def __init__(self, fut: "asyncio.Task"):
+        self.fut = fut
+        self.done_at = 0.0
+        fut.add_done_callback(lambda _t: setattr(self, "done_at", time.monotonic()))
+
+
+def _start_head(media, url: str, on_progress=None) -> _HeadStart:
+    """Launch the head-start download of the already-chosen candidate. Only the
+    chosen best is ever pre-started — no speculative downloads of runner-ups."""
+    return _HeadStart(asyncio.create_task(media.download_audio(url, on_progress=on_progress)))
+
+
+def _discard_head(head) -> None:
+    """Detach an unused head-start download (rare race: the file_id got cached,
+    or degraded mode kicked in, after the head start). The yt-dlp subprocess
+    cannot be cancelled cleanly, so it runs out; the done-callback retrieves the
+    result/error (no "exception was never retrieved") and deletes the temp files."""
+    if head is None:
+        return
+
+    def _clean(t):
+        try:
+            m4a, thumb, _ = t.result()
+        except Exception:
+            return
+        for p in (m4a, thumb):
+            if p:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    head.fut.add_done_callback(_clean)
+
+
+async def _drop_card(card) -> None:
+    """Delete the early card of a track whose download failed — a cover of an
+    undeliverable track must not linger above the failure message."""
+    if card is None:
+        return
+    try:
+        await card.delete()
+    except Exception:
+        pass
+
+
 # Groups with slow mode: a bot-member's NEW message inside the window is
 # rejected with RetryAfter = the rest of the window (message EDITS are not
 # restricted). Prod case 03.11: two candidates burned against a 1/min group,
-# the user got "Не смог скачать ни один из вариантов" for a healthy track.
+# the user got "Не смог скачать ни один из вариантов" (RU: "couldn't
+# download any of the variants") for a healthy track.
 _SLOW_MODE_MAX_WAIT = 45  # sec; a longer wait means a very slow group — refuse honestly
 
 
@@ -736,6 +911,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     desc = re.sub(r"@(?:music_search_mate_bot|music_search_dev_bot)\b", "", desc).strip()
     if not desc:
         return
+    # Duplicate-update guard (see _drop_duplicate): drop the redelivered copy
+    # of this same text before it starts a second search.
+    if _drop_duplicate(update.effective_chat.id if update.effective_chat else 0, desc):
+        log.warning("duplicate update dropped (chat=%s)", update.effective_chat.id)
+        return
     if len(desc) > 500:
         # Don't go silent on long input — ask the user to rephrase.
         await update.message.reply_text(await _t(user.id, "too_long"))
@@ -755,8 +935,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # per-chat lock: two back-to-back messages in one chat must not start parallel
     # pipelines — otherwise a race on chat_data / status / q:{id} / rejected_ids.
-    # The second message waits for the first to finish.
-    async with _chat_lock(update.effective_chat.id):
+    # The second message waits for the first to finish — but NEVER forever
+    # (10.11: a hung delivery held the lock and every following message in
+    # the chat queued on it silently; the black box showed Event.wait).
+    _lk = _chat_lock(update.effective_chat.id)
+    _lk_held = False
+    try:
+        await asyncio.wait_for(_lk.acquire(), 180.0)
+        _lk_held = True
+    except asyncio.TimeoutError:
+        log.error("chat lock wait timed out (chat=%s) — previous request stuck, "
+                  "processing unlocked", update.effective_chat.id)
+    try:
         # refinement intercept: within the TTL window after "Уточнить" any text counts as
         # an edit of the previous query. The state is one-shot, but we pop() it only when
         # actually entering refinement: rate-limit is checked BEFORE extraction, otherwise
@@ -850,6 +1040,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if out is None:
             return
         await _finish_search(update, context, status, out, desc, user)
+    finally:
+        # the chat lock is released even when the delivery path dies mid-way
+        # (every return above passes through here)
+        if _lk_held:
+            _lk.release()
 
 
 def _wtp_markup(lang: str = "ru") -> InlineKeyboardMarkup:
@@ -947,8 +1142,9 @@ async def _maybe_wtp(update, context, user, trigger: str, feature: str, usage_n:
     # llm_search was an ImportError-P0 (the name doesn't exist there) — it crashed
     # _check_limits on the very first limit hit
     try:
-        # Owner's wording: an honest frame instead of "помоги определиться" —
-        # enthusiasm, no ads, growing load; paid content is video only (GB of traffic)
+        # Owner's wording: an honest frame instead of "помоги определиться"
+        # (RU: "help me decide") - enthusiasm, no ads, growing load;
+        # paid content is video only (GB of traffic)
         await update.effective_chat.send_message(
             await _t(user.id, "wtp_survey"), reply_markup=_wtp_markup(await _lang_of(user.id)))
     except Exception:
@@ -956,12 +1152,16 @@ async def _maybe_wtp(update, context, user, trigger: str, feature: str, usage_n:
 
 
 async def _do_search(update, context, status, desc, excluded_ids=None,
-                     excluded_artists=None):
+                     excluded_artists=None, excluded_titles=None,
+                     restart_streak=0):
     """Streaming status + search_candidates. Returns SearchOut or None (error already shown).
 
     excluded_ids — rejected video_ids (refinement), passed to search_candidates for
     deterministic exclusion before ranking. excluded_artists — _ref_key of rejected
     candidates' channels (a miss streak drops the whole wrong neighborhood).
+    excluded_titles — raw titles of rejected tracks: the same song from ANY other
+    upload/channel is dropped, and restart echo-queries naming them die too.
+    restart_streak — miss count driving the neighbor-window rotation on restart.
     Shared path for new searches and refinements."""
     bothub = context.bot_data["bothub"]
     _t_search0 = time.monotonic()  # query latency for the queries table
@@ -1051,9 +1251,13 @@ async def _do_search(update, context, status, desc, excluded_ids=None,
         out = await search_candidates(desc, bothub, context=ctx_history,
                                       excluded_ids=excluded_ids,
                                       excluded_artists=excluded_artists,
+                                      excluded_titles=excluded_titles,
+                                      restart_streak=restart_streak,
                                       on_progress=on_progress,
                                       metadata_svc=context.bot_data.get("metadata"),
-                                      trace=trace)
+                                      trace=trace,
+                                      user_id=update.effective_user.id,
+                                      store=store_svc)
     except Exception:
         prog["alive"] = False
         pulse.cancel()
@@ -1093,6 +1297,14 @@ async def _do_search(update, context, status, desc, excluded_ids=None,
         return None
     out.latency_ms = int((time.monotonic() - _t_search0) * 1000)
     return out
+
+
+# Download-fallback quality gate (prod case 04.11 "дип перпл кинг оф дримс",
+# RU transliteration of "deep purple king of dreams"):
+# the user was promised the FIRST candidate; a fallback whose score dropped more
+# than this far below it is a different track in practice (1.0 -> 0.3 silently
+# delivered a wrong musical) and must never be auto-delivered.
+_DROP_TOLERANCE = 0.35
 
 
 async def _finish_search(update, context, status, out, desc, user):
@@ -1194,30 +1406,80 @@ async def _finish_search(update, context, status, out, desc, user):
                                             "match_score": best.match_score if best else None}) if trace else None
     # Designed with the owner: the card is ONE audio message with the cover in the
     # player (thumbnail + ID3) and a structured caption; a separate photo card is
-    # not sent (complaint: "сперва картинка, потом песня - должно быть одним").
+    # not sent (complaint: "сперва картинка, потом песня - должно быть одним"
+    # = RU "first the picture, then the song - it should be one").
     if sp_decide:
         sp_decide.finish(output={"decision": "single+download"})
-    if trace:
-        trace.finish(output={"decision": "single+download", "best": best.title if best else None})
+
+    def _trace_finish(decision: str = "single+download") -> None:
+        # Close the trace AFTER the download loop, not before it: the loop's dead
+        # ends rewrite the final decision (download-refused-quality), and a finish
+        # issued earlier would already have closed the trace for good.
+        if trace:
+            trace.finish(output={"decision": decision,
+                                 "best": best.title if best else None})
+
     if best:
-        # download fallback: on error (403, etc.) try the next candidate, up to 2 attempts
+        # Audio head start (owner complaint 04.11: the user sat waiting between
+        # the card and the file because the download only began after the card
+        # path did). The winner is already decided here, so its download starts
+        # NOW and runs in parallel with the card render/send inside _send_track;
+        # the audio send then only awaits it. The cached file_id fast path stays
+        # first: a track already sent once spawns no download task at all.
+        head = None
+        try:
+            _hit = await get_cached_file(best.video_id)
+        except Exception:
+            log.exception("get_cached_file failed %s", best.video_id)
+            _hit = None
+        if not (_hit and _hit.get("file_id")):
+            head = _start_head(
+                media,
+                best.url or f"https://www.youtube.com/watch?v={best.video_id}",
+                on_progress=_dl_progress_cb(status, update.effective_user.id))
+        # download fallback: on error (403, etc.) try the next candidate, up to 2
+        # attempts — but only while the fallback is a comparable match. A next
+        # candidate may be auto-delivered only if its score is within
+        # _DROP_TOLERANCE of the FIRST candidate (the one the user was promised).
+        # The head start only covers the best; a fallback candidate's download
+        # starts at the moment it is tried (no pre-fetch of runner-ups).
         for offset in range(min(2, len(out.candidates))):
             idx = out.best_index + offset
             if idx >= len(out.candidates):
+                break
+            if offset and best.score - out.candidates[idx].score > _DROP_TOLERANCE:
+                log.info("fallback #%d gated: score %.2f is more than %.2f below the promised best %.2f",
+                         idx, out.candidates[idx].score, _DROP_TOLERANCE, best.score)
                 break
             track = out.candidates[idx]
             try:
                 ok = await _send_track(update, context, status, media, query_id, idx,
                                        out.candidates, track, out.confidence,
-                                       out.verdict if idx == out.best_index else track.rationale)
+                                       out.verdict if idx == out.best_index else track.rationale,
+                                       head=(head if idx == out.best_index else None))
             except _SlowModeRefused:
+                _trace_finish()
                 return  # the honest slow-mode text is already in the status
             if ok:
+                _trace_finish()
                 return
-        # all attempts failed
-        if status:
-            await status.edit_text(await _t(update.effective_user.id, "dl_none"))
+        # dead end: every attempt failed or was gated out by match quality
+        if best.score >= _DROP_TOLERANCE:
+            # The good match exists but YouTube refuses to give it up, and the
+            # remaining candidates are much worse ones — an honest refusal naming
+            # the promised track instead of a silently wrong file.
+            _trace_finish("download-refused-quality")
+            if status:
+                await status.edit_text(await _t(update.effective_user.id, "dl_refused",
+                                                title=_button_label(best.title, best.channel)))
+        else:
+            # Nothing in the pool was even close to the query — the generic
+            # all-failed text (no title worth naming).
+            _trace_finish()
+            if status:
+                await status.edit_text(await _t(update.effective_user.id, "dl_none"))
         return
+    _trace_finish()
     if status:
         await status.edit_text(await _t(update.effective_user.id, "nothing_found"))
 
@@ -1423,6 +1685,51 @@ def _visible_candidates(candidates):
     return (scored or list(enumerate(candidates)))[:3]
 
 
+def _next_fresh_index(candidates, rank: int, rejected_ids) -> int:
+    """The miss chain's next candidate: the first index after `rank` that is
+    NOT the same RECORD as any rejected candidate. Same-record identity, not
+    exact key equality (live 06.11, Iron Man 2: the rejected
+    «AC/DC - Shoot To Thrill (Iron Man 2 Version)» was followed by
+    «AC/DC - Shoot to Thrill - Iron Man 2 Version» — the version tag without
+    brackets cleans to a DIFFERENT exact key, so the old guard served the
+    same song under another upload). _same_record also matches >= 2-token
+    subsets, mirroring the search-level title exclusion."""
+    from services.pipelines._diversity import _same_record, _title_tokens
+    rejected = {t for t in (_title_tokens(c.title) for c in candidates
+                            if c.video_id in (rejected_ids or []))
+                if t}
+
+    def _fresh(title: str) -> bool:
+        t = _title_tokens(title)
+        return not t or not any(_same_record(t, r) for r in rejected)
+
+    idx = rank + 1
+    while idx < len(candidates) and not _fresh(candidates[idx].title):
+        idx += 1
+    return idx
+
+
+_VERDICT_ADVICE_RE = re.compile(
+    r"пожалуйста|укажите|указать|исправь|поправь|переименуй|id3|тег(ах|и)?\b|"
+    r"please|rename|tag\b|metadata|your file|ваш(его|) файл", re.I)
+
+
+def _sanitize_verdict(v: str) -> str:
+    """The ranker sometimes appends ADVICE to its verdict (11.11 live:
+    «Музыку к фильму... написали The Dust Brothers. Пожалуйста, укажите
+    правильное имя исполнителя в ID3-тегах вашего файла» - RU: "the film
+    score was written by The Dust Brothers. Please set the correct artist
+    name in the ID3 tags of your file"). Facts stay, instruction sentences
+    are dropped - the bot itself handles file tags, the user asked for
+    nothing."""
+    v = (v or "").strip()
+    if not v:
+        return v
+    kept = [s for s in re.split(r"(?<=[.!?])\s+", v)
+            if not _VERDICT_ADVICE_RE.search(s)]
+    return " ".join(kept).strip() or v.split(".")[0].rstrip(".")
+
+
 def _render_preview(query_id, candidates, verdict="", intro="", lang="ru"):
     """Text + keyboard of the top-3 preview. Shared by the initial send and by
     RESTORING the preview after the chosen download failed (before, the buttons
@@ -1433,6 +1740,7 @@ def _render_preview(query_id, candidates, verdict="", intro="", lang="ru"):
     for n, (_, c) in enumerate(top):
         pt = _button_label(c.title, c.channel)
         lines.append(f"{n + 1}. {pt}")
+    verdict = _sanitize_verdict(verdict)
     if verdict:
         lines.append(f"\n{verdict}")
     rows = []
@@ -1487,7 +1795,11 @@ async def _is_degraded(context) -> bool:
         return False
 
 
-async def _send_track(update, context, status, media, query_id, rank, candidates, track, confidence, verdict="", keyboard="feedback"):
+async def _send_track(update, context, status, media, query_id, rank, candidates, track, confidence, verdict="", keyboard="feedback", head=None):
+    """Send one track: cached file_id fast path -> early cover card (while the
+    download runs) -> audio. `head` is a pre-started download of this track
+    (from _finish_search); without one the download starts here — still in
+    parallel with the card, only a candidate fallback downloads inline-first."""
     metadata_svc = context.bot_data["metadata"]
     kb = _reply_keyboard(query_id, rank, keyboard, vid=track.video_id,
                                lang=await _lang_of(update.effective_user.id))
@@ -1559,7 +1871,7 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                     return await context.bot.send_audio(
                         chat_id=update.effective_chat.id,
                         audio=cached["file_id"],
-                        caption=_caption(cached_meta, track, confidence, verdict),
+                        caption=_caption(cached_meta, track, confidence, _sanitize_verdict(verdict)),
                         parse_mode=ParseMode.HTML, reply_markup=kb,
                         performer=(cached_meta.artist or "")[:64],
                         title=(cached_meta.track or "")[:64],
@@ -1572,9 +1884,11 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                 # slow mode hit the cache path too — a re-download would face
                 # the same window; propagate (the function-level handler cancels
                 # the indicator, the caller stops the loop honestly)
+                _discard_head(head)  # a pre-started download is now pointless
                 raise
             except Exception:
                 # file_id went stale / network — fall through to the regular download below
+                # (a pre-started head, if any, is still exactly what is needed)
                 log.exception("send_audio cached failed (fallback to download): %s", track.video_id)
             else:
                 await insert_event(user_id=update.effective_user.id, kind="cache_hit",
@@ -1583,9 +1897,11 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                     context, update, query_id, track,
                     cached_meta.artist, cached_meta.track)
                 _ua.cancel()
+                _discard_head(head)  # rare race: the file got cached after the head start
                 return True
 
     m4a_path, thumb, art = None, None, None
+    art0 = None  # artwork of the early card (cleaned alongside the rest)
     # Degraded mode — send a link instead of the file
     if await _is_degraded(context):
         _btn = _button_label(track.title, track.channel)
@@ -1599,25 +1915,73 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
             if status:
                 await status.delete()
             _ua.cancel()  # an upload_document loop would run forever without cancel
+            _discard_head(head)  # no file will be sent — release the head start
             return True
         _ua.cancel()
+        _discard_head(head)
         return False
 
-    async def _dl_progress(pct: float) -> None:
-        # live download progress in the status message
-        if status is None:
-            return
-        try:
-            await status.edit_text(await _t(update.effective_user.id, "dl_bar",
-                                          bar=_progress_bar(pct), pct=int(pct)))
-        except Exception:
-            pass
+    # ── audio head start ──
+    # The download of the already-chosen track runs in parallel with the card
+    # below; the audio send only awaits it. Without a passed-in head (candidate
+    # fallback, miss chain, pk/dl:aud buttons) it starts right here — still
+    # overlapped with the card, never blocking its render.
+    if head is None:
+        head = _start_head(
+            media,
+            track.url or f"https://www.youtube.com/watch?v={track.video_id}",
+            on_progress=_dl_progress_cb(status, update.effective_user.id) if status else None)
 
+    # ── early cover card ──
+    # Owner decision after live tests: a photo card with the cover as a
+    # SEPARATE message before the audio (a thumbnail in send_audio does NOT
+    # render as a visible photo; the embedded cover is only visible inside the
+    # player). Album cover from iTunes ONLY, no YouTube screenshots (prod case
+    # GTA VI). The card is rendered from a PRE-DOWNLOAD metadata resolve built
+    # off the candidate's title/channel — the user sees the track while yt-dlp
+    # is still running, and the audio follows within seconds of the download
+    # finishing. The caption/tags keep the full post-download resolve (Content
+    # ID quality); the metadata TTL cache absorbs the second resolve's
+    # overlapping Last.fm/iTunes calls. No album cover = no photo.
+    card = None
+    try:
+        meta0 = await metadata_svc.resolve(
+            {"title": track.title, "channel": track.channel,
+             "uploader": track.channel, "id": track.video_id},
+            track.video_id)
+    except Exception:
+        meta0 = None
+    _aw0 = getattr(meta0, "artwork_url", "") if meta0 else ""
+    if _aw0:
+        try:
+            card = await update.effective_chat.send_photo(photo=_aw0)
+        except Exception as e:
+            # not fatal (the audio goes anyway), but a silent swallow hid group
+            # slow-mode rejections (03.11) — keep a trace
+            log.debug("cover photo (head-start url) not sent: %s", str(e)[:80])
+    else:
+        _aw0p = getattr(meta0, "artwork_path", None) if meta0 else None
+        if _aw0p and Path(_aw0p).exists():
+            art0 = str(_aw0p)
+            try:
+                with open(_aw0p, "rb") as _cf:
+                    card = await update.effective_chat.send_photo(
+                        photo=InputFile(_cf, filename="cover.jpg"))
+            except Exception as e:
+                log.debug("cover photo (head-start file) not sent: %s", str(e)[:80])
+
+    _t_card = time.monotonic()
+    _head_ready = head.fut.done()  # the download already finished before the card
     try:
         try:
-            url = track.url or f"https://www.youtube.com/watch?v={track.video_id}"
-            m4a_path, thumb, info = await media.download_audio(
-                url, on_progress=_dl_progress if status else None)
+            m4a_path, thumb, info = await head.fut
+            # observability: evidence the head start works in prod logs
+            if _head_ready:
+                log.info("audio head start: download ready before card sent (saved ~%.1fs)",
+                         max(0.0, _t_card - (head.done_at or _t_card)))
+            else:
+                log.info("audio head start: card waited %.1fs for download",
+                         time.monotonic() - _t_card)
             # After 100% comes convert+meta+tags (10-25s without updates) —
             # switch the status so the bar doesn't look frozen
             if status:
@@ -1633,6 +1997,7 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                     m4a_path, thumb, info = await media.download_audio(track.fallback_url)
                 except Exception as e2:
                     log.warning("fallback also failed: %s", str(e2)[:200])
+                    await _drop_card(card)  # no cover of an undeliverable track
                     if status:
                         await status.edit_text(await _t(update.effective_user.id, "dl_track_fail", title=pretty_title(track.title)[:60]))
                     else:
@@ -1640,6 +2005,7 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                     _ua.cancel()
                     return False
             else:
+                await _drop_card(card)
                 if status:
                     await status.edit_text(await _t(update.effective_user.id, "dl_track_fail", title=pretty_title(track.title)[:60]))
                 else:
@@ -1671,34 +2037,32 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                                          meta.artist, meta.track, meta.year)
         if meta and meta.bio:
             meta.bio = await _translate_bio(context, update.effective_user.id, meta.bio)
-        caption = _caption(meta, track, confidence, verdict)
+        caption = _caption(meta, track, confidence, _sanitize_verdict(verdict))
         try:
             with open(m4a_path, "rb") as f:
                 _meta_title = (meta.track if meta else None) or pretty_title(track.title)
                 _meta_artist = (meta.artist if meta else None) or pretty_title(track.channel)
 
-                # Owner decision after live tests: a photo card with the cover
-                # as a SEPARATE message before the audio. A thumbnail in
-                # send_audio does NOT render as a visible photo (confirmed by
-                # tests 1-3); the embedded cover is only visible inside the player.
-                # Album cover from iTunes ONLY.
-                # YouTube screenshots were removed (prod case GTA VI: a random frame instead
-                # of the cover). No album cover = no photo; better without a picture.
-                _aw_url = getattr(meta, "artwork_url", "") if meta else ""
-                if _aw_url:
-                    try:
-                        await update.effective_chat.send_photo(photo=_aw_url)
-                    except Exception as e:
-                        # not fatal (the audio goes anyway), but a silent swallow
-                        # hid group slow-mode rejections (03.11) — keep a trace
-                        log.debug("cover photo (url) not sent: %s", str(e)[:80])
-                elif meta and meta.artwork_path and Path(meta.artwork_path).exists():
-                    try:
-                        with open(meta.artwork_path, "rb") as _cf:
-                            await update.effective_chat.send_photo(
-                                photo=InputFile(_cf, filename="cover.jpg"))
-                    except Exception as e:
-                        log.debug("cover photo (file) not sent: %s", str(e)[:80])
+                # The cover card normally goes out EARLY (before the download,
+                # see the head-start block above). This is the fallback for a
+                # card-less track whose full post-download resolve found a
+                # cover after all — no photo twice.
+                if card is None:
+                    _aw_url = getattr(meta, "artwork_url", "") if meta else ""
+                    if _aw_url:
+                        try:
+                            await update.effective_chat.send_photo(photo=_aw_url)
+                        except Exception as e:
+                            # not fatal (the audio goes anyway), but a silent swallow
+                            # hid group slow-mode rejections (03.11) — keep a trace
+                            log.debug("cover photo (url) not sent: %s", str(e)[:80])
+                    elif meta and meta.artwork_path and Path(meta.artwork_path).exists():
+                        try:
+                            with open(meta.artwork_path, "rb") as _cf:
+                                await update.effective_chat.send_photo(
+                                    photo=InputFile(_cf, filename="cover.jpg"))
+                        except Exception as e:
+                            log.debug("cover photo (file) not sent: %s", str(e)[:80])
 
                 # Thumbnail = album cover (the owner confirmed Telegram
                 # shows it in the player). The fd is closed in finally (it leaked
@@ -1802,7 +2166,7 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
         return True
     finally:
         # clean temp files right after sending; don't wait for the TTL cleanup
-        for p in (m4a_path, thumb, art):
+        for p in (m4a_path, thumb, art, art0):
             if p:
                 try:
                     await asyncio.to_thread(os.remove, p)
@@ -1873,6 +2237,25 @@ def _bio_line(meta) -> str:
 
 
 _TR_CACHE: dict = {}  # (hash(...), kind, lang) -> (ts, text): bio translations
+# (chat_id, hash(text)) -> monotonic ts: the duplicate-update guard window
+_recent_descs: dict = {}
+
+
+def _drop_duplicate(chat_id: int | None, text: str, window: float = 20.0) -> bool:
+    """True when the SAME text from the SAME chat arrived inside the window.
+    Telegram redelivers an update when its offset confirmation is lost on a
+    network flap (10.11: one user message started two searches, two status
+    messages with different intros, two traces). A deliberate repeat after
+    the window still works; restarts carry 'Not this:' tails and never match."""
+    key = (chat_id or 0, hash(text))
+    now = time.monotonic()
+    ts = _recent_descs.get(key)
+    if ts is not None and now - ts < window:
+        return True
+    if len(_recent_descs) > 512:
+        _recent_descs.clear()  # a flat window, not a leak
+    _recent_descs[key] = now
+    return False
 # and sonar facts repeat (24h in memory; facts are doubled by the persistent store.facts cache, 30d)
 
 
@@ -2036,6 +2419,142 @@ def _refine_prompt(reply_text: str, lang: str = "ru") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(_kbt(lang, "cancel"), callback_data="rfx")]])
 
 
+async def _start_video_download(update, context, q, media_svc, user, vid, url,
+                                title, url_state, quality) -> bool:
+    """Shared starter for every video-by-link download (a picker selection
+    dl:q:{q}:{vid}): daily cap + busy-guard, a queries row, a status, then
+    the download+send in the background. The sent file carries no keyboard
+    (owner 06.11: no post-delivery quality offers — the picker before the
+    download is the only quality UI). Returns True when the background task
+    was created (False = a gate rejected the request)."""
+    cfg = context.bot_data["cfg"]
+    v_usage = await get_usage(user.id)
+    if (v_usage.get("videos") or 0) >= cfg.video_daily_limit:
+        await _maybe_wtp(update, context, user, "video", "video",
+                         v_usage.get("videos") or 0)
+        await q.message.reply_text(
+            await _t(update.effective_user.id, "video_cap"))
+        return False
+    _busy = context.chat_data.get("video_busy")
+    if _busy and time.time() - _busy < 600:
+        await q.message.reply_text(await _t(update.effective_user.id, "video_busy"))
+        return False
+    context.chat_data["video_busy"] = time.time()
+    qlabel = _video_quality_label(quality)
+    # a queries row for the URL-video path too, so dl_video events link
+    # to a query (funnel conversion) like the audio path does
+    try:
+        _vqid = await insert_query(
+            user_id=user.id, correlation_id=uuid4().hex,
+            description=f"url-video: {title}", intent="direct_url",
+            signals=None, queries=[url], candidates=None,
+            best_video_id=vid, best_title=title, best_score=None,
+            confidence="high", latency_ms=url_state.get("meta_ms"),
+            chat_type=update.effective_chat.type if update.effective_chat else None)
+    except Exception:
+        _vqid = None
+    try:
+        # the picker text message normally edits fine; an already-edited/old
+        # message fails and is swallowed — the fresh vstat status below
+        # carries the text
+        await q.edit_message_text(await _t(update.effective_user.id, "video_start",
+                                          quality=qlabel, title=title[:50]))
+    except Exception:
+        pass
+
+    async def _bg_video():
+        path = None
+        vstat = None
+        try:
+            try:
+                vstat = await q.message.reply_text(
+                    await _t(update.effective_user.id, "video_start_short", quality=qlabel))
+            except Exception:
+                vstat = None
+
+            async def _vpct(p: float) -> None:
+                if vstat is None:
+                    return
+                try:
+                    await vstat.edit_text(await _t(update.effective_user.id, "dl_bar",
+                                              bar=_progress_bar(p), pct=int(p)))
+                except Exception:
+                    pass
+
+            path, info = await media_svc.download_video(
+                url, quality, on_progress=_vpct if vstat else None)
+            if vstat:  # convert/merge/send have no updates — switch the stage
+                try:
+                    await vstat.edit_text(await _t(update.effective_user.id, "st_processing"))
+                except Exception:
+                    pass
+            # the caption carries the quality that actually produced the file
+            # (media may have stepped down to stay under the Bot API limit)
+            chosen_tok = info.get("chosen_quality") or quality
+            chosen = _video_quality_label(chosen_tok)
+            fname = _button_label(title, info.get("channel", ""))[:60]
+            fname = re.sub(r'[\\/:*?"<>|]+', "", fname) or "video"
+            with open(path, "rb") as vf:
+                async def _video_send():
+                    # same EOF-guard as the audio path (a fresh attempt
+                    # re-reads the file from the start)
+                    try:
+                        vf.seek(0)
+                    except (OSError, ValueError):
+                        pass
+                    return await context.bot.send_video(
+                        chat_id=update.effective_chat.id,
+                        video=InputFile(vf, filename=f"{fname}.mp4"),
+                        caption=f"🎬 {title[:200]}\n📅 {info.get('upload_date', '?')[:4] or '?'} · {chosen}",
+                        supports_streaming=True,
+                        read_timeout=600, write_timeout=600, connect_timeout=30)
+                await _send_with_slow_mode(_video_send, vstat,
+                                           update.effective_user.id)
+            await incr_usage(user.id, "videos")
+            await insert_event(user_id=user.id, kind="dl_video", video_id=vid,
+                               query_id=_vqid)
+            try:
+                _mb = int(Path(path).stat().st_size / 1_048_576)
+                await incr_usage(user.id, "bytes_sent", _mb)
+            except Exception:  # non-OSError from store too
+                pass
+        except _SlowModeRefused as e:
+            # vstat carries the text when it exists; when the status
+            # reply itself was refused (vstat=None, typical in a
+            # slow-mode group), tell the user via the callback message
+            if not getattr(e, "notice_shown", False):
+                try:
+                    await q.message.reply_text(
+                        await _t(update.effective_user.id, "slow_mode_group"))
+                except Exception:
+                    pass
+        except Exception as e:
+            log.exception("video download failed: %s", str(e)[:100])
+            try:
+                await q.message.reply_text(
+                    await _t(update.effective_user.id, "video_fail"))
+            except Exception:
+                pass
+        finally:
+            # the mp4 is deleted even when send fails (it used to live until TTL)
+            if path:
+                try:
+                    await asyncio.to_thread(Path(path).unlink, True)
+                except Exception:
+                    pass
+            if vstat is not None:
+                try:
+                    await vstat.delete()
+                except Exception:
+                    pass
+            context.chat_data.pop("video_busy", None)
+
+    # update= — a background send error reaches the error handler with the
+    # user's live context; stop() on deploy waits out a 2GB send
+    context.application.create_task(_bg_video(), update=update)
+    return True
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
@@ -2071,14 +2590,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # persistent cache (free repeats), a per-user cap, a global budget for everyone.
     # The cache is checked BEFORE the limits (a cached fact is always free);
     # a negative result (sonar empty) is billed too — otherwise repeated clicks
-    # on "не нашлось" burn sonar past the caps; the id is cut with split(":", 1) — foreign ":" inside the id.
+    # on "не нашлось" (RU "nothing found") burn sonar past the caps; the id
+    # is cut with split(":", 1) - foreign ":" inside the id.
     if kind == "fact":
         vid = (q.data or "").split(":", 1)[1] if ":" in (q.data or "") else ""
         if vid:
             await insert_event(user_id=update.effective_user.id, kind="fact", video_id=vid)
         if not vid:
             return
-        # Complaint: "дает просто повтор". A cache hit on a second press looked like
+        # Complaint: "дает просто повтор" (RU: "it just repeats"). A cache
+        # hit on a second press looked like
         # a duplicate message. Now a second press within an hour gets a short
         # pointer up the thread, not a duplicate fact.
         _fs = context.chat_data.get(f"factshown:{vid}")
@@ -2226,21 +2747,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text(await _t(update.effective_user.id, "video_yt_only"))
             return
         yt_url = f"https://www.youtube.com/watch?v={vid}"
-        qualities = InlineKeyboardMarkup([
-            [InlineKeyboardButton("480p", callback_data=f"dl:q:480:{vid}"),
-             InlineKeyboardButton("720p", callback_data=f"dl:q:720:{vid}")],
-            [InlineKeyboardButton("1080p", callback_data=f"dl:q:1080:{vid}"),
-             InlineKeyboardButton("1440p", callback_data=f"dl:q:1440:{vid}")],
-        ])
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
         await q.message.reply_text(
             f"🎬 {track.title[:200]}\nВыбери качество:",
-            reply_markup=qualities)
+            reply_markup=_video_quality_picker(vid))
         context.chat_data[f"url:{vid}"] = {"url": yt_url, "title": track.title}
         return
+
+    # qvid (quality re-fetch buttons under a delivered video) is GONE — owner
+    # request 06.11: no post-delivery quality offers. Old messages still
+    # carrying qvid buttons fall through here unanswered (the generic
+    # q.answer() at the top stops the spinner).
 
     # Audio/Video download buttons for a URL
     if kind == "dl":
@@ -2253,18 +2773,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             action = data[1] if len(data) >= 3 else ""
             vid = data[2] if len(data) >= 3 else ""
-        url_state = context.chat_data.get(f"url:{vid}")
-        if url_state:
-            url = url_state["url"]
-            title = url_state["title"]
-        elif vid and len(vid) == 11:
-            # chat_data lives in memory — a container restart (deploy) loses it.
-            # A YouTube video_id is enough to rebuild the URL.
-            url = f"https://www.youtube.com/watch?v={vid}"
-            title = vid
-        else:
+        # chat_data url:{vid} first; a restart loses it, but an 11-char
+        # YouTube video_id is enough to rebuild the URL
+        ref = _resolve_video_ref(context, vid)
+        if ref is None:
             await q.message.reply_text(await _t(update.effective_user.id, "link_stale"))
             return
+        url, title, url_state = ref
         media_svc = context.bot_data["media"]
 
         if action == "aud":
@@ -2306,144 +2821,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "vid":
-            # Video: show the quality picker
-            qualities = InlineKeyboardMarkup([
-                [InlineKeyboardButton("480p", callback_data=f"dl:q:480:{vid}"),
-                 InlineKeyboardButton("720p", callback_data=f"dl:q:720:{vid}")],
-                [InlineKeyboardButton("1080p", callback_data=f"dl:q:1080:{vid}"),
-                 InlineKeyboardButton("1440p", callback_data=f"dl:q:1440:{vid}")],
-            ])
+            # Video: show the quality picker (the owner's original flow — the
+            # height is ALWAYS chosen explicitly, never a silent default
+            # download). The ladder is 240-1440, two buttons per row.
             try:
                 await q.edit_message_text(
                     f"🎬 {title[:200]}\nВыбери качество:",
-                    reply_markup=qualities)
+                    reply_markup=_video_quality_picker(vid))
             except Exception:
                 pass
             return
 
         if action.startswith("q:"):
-            # Video gets dedicated gates (GB-sized uploads are not let through unchecked) + a busy-guard.
-            # The upload goes into create_task — the PTB dispatcher is sequential,
-            # and a 2GB video (up to ~20 min) would otherwise stall the update queue of the WHOLE bot.
-            cfg = context.bot_data["cfg"]
-            v_usage = await get_usage(user.id)
-            if (v_usage.get("videos") or 0) >= cfg.video_daily_limit:
-                await _maybe_wtp(update, context, user, "video", "video",
-                                 v_usage.get("videos") or 0)
-                await q.message.reply_text(
-                    await _t(update.effective_user.id, "video_cap"))
-                return
-            _busy = context.chat_data.get("video_busy")
-            if _busy and time.time() - _busy < 600:
-                await q.message.reply_text(await _t(update.effective_user.id, "video_busy"))
-                return
-            context.chat_data["video_busy"] = time.time()
-            quality = data[2].rstrip("p") if len(data) >= 4 else "720"
-            quality = f"{quality}p"
-            # a queries row for the URL-video path too, so dl_video events link
-            # to a query (funnel conversion) like the audio path does
-            try:
-                _vqid = await insert_query(
-                    user_id=user.id, correlation_id=uuid4().hex,
-                    description=f"url-video: {title}", intent="direct_url",
-                    signals=None, queries=[url], candidates=None,
-                    best_video_id=vid, best_title=title, best_score=None,
-                    confidence="high", latency_ms=url_state.get("meta_ms"),
-                    chat_type=update.effective_chat.type if update.effective_chat else None)
-            except Exception:
-                _vqid = None
-            try:
-                await q.edit_message_text(await _t(update.effective_user.id, "video_start",
-                                              quality=quality, title=title[:50]))
-            except Exception:
-                pass
-
-            async def _bg_video():
-                path = None
-                vstat = None
-                try:
-                    try:
-                        vstat = await q.message.reply_text(
-                            await _t(update.effective_user.id, "video_start_short", quality=quality))
-                    except Exception:
-                        vstat = None
-
-                    async def _vpct(p: float) -> None:
-                        if vstat is None:
-                            return
-                        try:
-                            await vstat.edit_text(await _t(update.effective_user.id, "dl_bar",
-                                              bar=_progress_bar(p), pct=int(p)))
-                        except Exception:
-                            pass
-
-                    path, info = await media_svc.download_video(
-                        url, quality, on_progress=_vpct if vstat else None)
-                    if vstat:  # convert/merge/send have no updates — switch the stage
-                        try:
-                            await vstat.edit_text(await _t(update.effective_user.id, "st_processing"))
-                        except Exception:
-                            pass
-                    fname = _button_label(title, info.get("channel", ""))[:60]
-                    fname = re.sub(r'[\\/:*?"<>|]+', "", fname) or "video"
-                    with open(path, "rb") as vf:
-                        async def _video_send():
-                            # same EOF-guard as the audio path (a fresh attempt
-                            # re-reads the file from the start)
-                            try:
-                                vf.seek(0)
-                            except (OSError, ValueError):
-                                pass
-                            return await context.bot.send_video(
-                                chat_id=update.effective_chat.id,
-                                video=InputFile(vf, filename=f"{fname}.mp4"),
-                                caption=f"🎬 {title[:200]}\n📅 {info.get('upload_date', '?')[:4] or '?'}",
-                                supports_streaming=True,
-                                read_timeout=600, write_timeout=600, connect_timeout=30)
-                        await _send_with_slow_mode(_video_send, vstat,
-                                                   update.effective_user.id)
-                    await incr_usage(user.id, "videos")
-                    await insert_event(user_id=user.id, kind="dl_video", video_id=vid,
-                                       query_id=_vqid)
-                    try:
-                        _mb = int(Path(path).stat().st_size / 1_048_576)
-                        await incr_usage(user.id, "bytes_sent", _mb)
-                    except Exception:  # non-OSError from store too
-                        pass
-                except _SlowModeRefused as e:
-                    # vstat carries the text when it exists; when the status
-                    # reply itself was refused (vstat=None, typical in a
-                    # slow-mode group), tell the user via the callback message
-                    if not getattr(e, "notice_shown", False):
-                        try:
-                            await q.message.reply_text(
-                                await _t(update.effective_user.id, "slow_mode_group"))
-                        except Exception:
-                            pass
-                except Exception as e:
-                    log.exception("video download failed: %s", str(e)[:100])
-                    try:
-                        await q.message.reply_text(
-                            await _t(update.effective_user.id, "video_fail"))
-                    except Exception:
-                        pass
-                finally:
-                    # the mp4 is deleted even when send fails (it used to live until TTL)
-                    if path:
-                        try:
-                            await asyncio.to_thread(Path(path).unlink, True)
-                        except Exception:
-                            pass
-                    if vstat is not None:
-                        try:
-                            await vstat.delete()
-                        except Exception:
-                            pass
-                    context.chat_data.pop("video_busy", None)
-
-            # update= — a background send error reaches the error handler with the
-            # user's live context; stop() on deploy waits out a 2GB send
-            context.application.create_task(_bg_video(), update=update)
+            # a quality picked in the picker (dl:q:{q}:{vid}, also fires on old
+            # messages with the 480-1440 ladder) — the shared starter (gates +
+            # background send); the upload goes into create_task because the
+            # PTB dispatcher is sequential and a long video send would stall
+            # the update queue
+            quality = data[2].rstrip("p") if len(data) >= 4 else _DEFAULT_VIDEO_QUALITY
+            await _start_video_download(update, context, q, media_svc, user, vid,
+                                        url, title, url_state, quality)
             return
 
     # donate button -> XTR invoice
@@ -2488,10 +2885,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lang = data[1] if len(data) == 2 and data[1] in ("ru", "en") else None
         if lang:
             await set_user_lang(user.id, lang)
+            # Live-test F1: switch the "/" command menu too. Per-chat scope
+            # WITHOUT language_code is more specific than the startup default
+            # scope, so the chosen language wins over the client locale.
+            # Failure-tolerant on purpose: an API hiccup here must never
+            # block the edit/greeting below.
+            try:
+                await context.bot.set_my_commands(
+                    bot_commands(lang), scope=BotCommandScopeChat(user.id))
+            except Exception as e:
+                log.debug("set_my_commands(chat scope) failed user=%s: %s", user.id, e)
             try:
                 await q.edit_message_text(f"✅ {('Русский' if lang == 'ru' else 'English')}")
             except Exception:
                 pass
+            # The greeting follows immediately after the language choice
+            # (prod report 2026-11-04: it never arrived before, the user had
+            # to send /start a second time)
+            try:
+                await _send_greeting(q.message, lang)
+            except Exception:
+                log.exception("greeting after language choice failed user=%s", user.id)
         return
 
     # preview carousel: paging cards without server-side state (index in the callback)
@@ -2653,28 +3067,45 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = await q.message.reply_text(await _status_text(update.effective_user.id, "st_other"))
             out = await _do_search(update, context, status, desc2,
                                    excluded_ids=set(store.get("rejected_ids") or []),
-                                   excluded_artists={a for a in rej_artists if a})
+                                   excluded_artists={a for a in rej_artists if a},
+                                   excluded_titles=set(rej_titles),
+                                   restart_streak=streak)
             if out is not None and out.candidates:
                 await _finish_search(update, context, status, out, desc2, user)
                 return
             # search failed -> old behavior below (next candidate from the pool)
 
-        # miss -> the next candidate (limit: best + 3 more, DoS protection via "Не то")
-        if not candidates or rank + 1 >= len(candidates):
+        # miss -> the next candidate (limit: best + 3 more, DoS protection via "Не то").
+        # The next candidate must not be the SAME SONG under another upload: the live
+        # «Come Clean x4» case served Hilary Duff rank+1 after a miss on rank0.
+        # (candidates can be None when the state was evicted — guard first.)
+        if not candidates:
+            await q.message.reply_text(await _t(update.effective_user.id, "variants_over"))
+            await _evict_state(context, query_id)
+            return
+        # Same-RECORD identity, not exact key equality (live 06.11, Iron Man 2
+        # case: a rejected «AC/DC - Shoot To Thrill (Iron Man 2 Version)» was
+        # followed by «AC/DC - Shoot to Thrill - Iron Man 2 Version» — the
+        # version tag without brackets cleans to a DIFFERENT exact key, so the
+        # guard missed the same song under another upload). _same_record also
+        # matches >= 2-token subsets, like the search-level title exclusion.
+        _nxt_idx = _next_fresh_index(candidates, rank,
+                                     store.get("rejected_ids") or [])
+        if _nxt_idx >= len(candidates):
             await q.message.reply_text(await _t(update.effective_user.id, "variants_over"))
             await _evict_state(context, query_id)
             return
         best_idx = store.get("best_index", 0) if store else 0
-        if rank + 1 > best_idx + 3:
+        if _nxt_idx > best_idx + 3:
             await q.message.reply_text(await _t(update.effective_user.id, "last_variant"))
             await _evict_state(context, query_id)
             return
-        nxt = candidates[rank + 1]
+        nxt = candidates[_nxt_idx]
         if await _sends_over(update, context, user):
             return
         status = await q.message.reply_text(await _status_text(update.effective_user.id, "st_other"))
         try:
-            await _send_track(update, context, status, media, query_id, rank + 1, candidates,
+            await _send_track(update, context, status, media, query_id, _nxt_idx, candidates,
                               nxt, store["confidence"], nxt.rationale)
         except _SlowModeRefused:
             return  # the honest slow-mode text is already in the status
@@ -2699,6 +3130,8 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     without trips to Langfuse."""
     if _denied(update, context):
         return
+    if _not_owner(update, context):
+        return
     user = update.effective_user
     try:
         u = await get_usage(user.id)
@@ -2714,7 +3147,7 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    fa=f(u,'facts'), v=f(u,'videos'), mb=f(u,'bytes_sent'))
         + "\n"
         + await _t(user.id, "stats_all", s=f(g,'searches'), f=f(g,'sends'),
-                   fa=f(g,'facts'), v=f(g,'videos'), mb=f(g,'bytes_sent')),
+                   fa=f(g,'facts'), v=f(g,'videos'), mb=f(g,'bytes_sent'))
         + "\n" + await _stats_funnel(user.id),
         parse_mode=_PM.HTML)
 

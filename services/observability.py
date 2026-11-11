@@ -16,6 +16,51 @@ import time
 _log = logging.getLogger("bot.obs")
 
 
+# ---------- neutral tech-metric hooks (wave 45-3) ----------
+# services/ does NOT depend on web/: the engine only EMITS events (search
+# stage, external call, gauge delta), and the subscriber, web/metrics.py,
+# attaches its callbacks to the lists below when the web layer is assembled.
+# A hook call never raises and never changes engine behavior; with no
+# subscribers it is a full no-op (the bot process runs without the web
+# layer and without prometheus-client).
+
+STAGE_HOOKS: list = []     # (stage: str, seconds: float) - per-stage search timings
+EXTERNAL_HOOKS: list = []  # (call: str, outcome: str, seconds: float) - external calls
+GAUGE_HOOKS: list = []     # (name: str, delta: float) - gauge increments/decrements
+
+
+def emit_stage(stage: str, seconds: float) -> None:
+    """Search stage finished (llm1_extract / yt_search / ...) in seconds."""
+    for hook in list(STAGE_HOOKS):
+        try:
+            hook(stage, seconds)
+        except Exception:
+            pass
+
+
+def emit_external(call: str, outcome: str, seconds: float) -> None:
+    """External call (llm / lastfm / ytdlp / ...) finished with the given outcome."""
+    for hook in list(EXTERNAL_HOOKS):
+        try:
+            hook(call, outcome, seconds)
+        except Exception:
+            pass
+
+
+def emit_gauge(name: str, delta: float) -> None:
+    """Gauge delta (e.g. +1/-1 of waiting for a yt-dlp slot)."""
+    for hook in list(GAUGE_HOOKS):
+        try:
+            hook(name, delta)
+        except Exception:
+            pass
+
+
+# Breaker registry for observation (the msm_circuit_open gauge reads states
+# on scrape): name -> the most recently created breaker of the process.
+BREAKERS: dict[str, "CircuitBreaker"] = {}
+
+
 # ---------- circuit breaker ----------
 
 class CircuitBreaker:
@@ -28,6 +73,8 @@ class CircuitBreaker:
         self.cooldown = cooldown
         self._failures = 0
         self._opened_at = 0.0
+        # wave 45-3: registration for tech metrics (observation, not logic)
+        BREAKERS[name] = self
 
     @property
     def is_open(self) -> bool:

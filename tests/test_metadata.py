@@ -155,6 +155,239 @@ async def test_lastfm_cache_single_network_call(monkeypatch):
     await svc.aclose()
 
 
+# ════ tag.gettoptracks (the mood pipeline's empirical pools) ════
+
+class _FakeResp:
+    """A minimal httpx.Response stand-in: status_code + json payload."""
+
+    def __init__(self, status_code=200, payload=None, raise_exc=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self._raise = raise_exc
+
+    def json(self):
+        if self._raise:
+            raise self._raise
+        return self._payload
+
+
+def _lfm_tag_payload(*tracks):
+    """A Last.fm tag.gettoptracks JSON payload: artist embedded as {name}."""
+    return {"tracks": {"track": [
+        {"name": t["track"], "artist": {"name": t["artist"]},
+         "listeners": str(t["listeners"])}
+        for t in tracks
+    ]}}
+
+
+@pytest.mark.asyncio
+async def test_tag_top_tracks_success_mapping(monkeypatch):
+    """tag.gettoptracks success: [{artist, track, listeners}] with int
+    listeners, in the tag-chart rank order (the chart IS the relevance)."""
+    from services.metadata import MetadataService
+    svc = MetadataService("k")
+
+    async def fake_get(url, params=None):
+        assert params["method"] == "tag.gettoptracks"
+        assert params["tag"] == "workout"
+        assert params["limit"] == "6"
+        return _FakeResp(payload=_lfm_tag_payload(
+            {"artist": "Survivor", "track": "Eye of the Tiger", "listeners": 500},
+            {"artist": "Eminem", "track": "Till I Collapse", "listeners": 900},
+        ))
+    monkeypatch.setattr(svc._http, "get", fake_get)
+
+    out = await svc.tag_top_tracks("workout")
+    assert out == [
+        {"artist": "Survivor", "track": "Eye of the Tiger", "listeners": 500},
+        {"artist": "Eminem", "track": "Till I Collapse", "listeners": 900},
+    ]
+    await svc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tag_top_tracks_failure_returns_empty(monkeypatch):
+    """Non-200, a Last.fm error payload and a transport exception all -> []
+    (failure-silence, the same contract as similar_artists/track_search)."""
+    from services.metadata import MetadataService
+    svc = MetadataService("k")
+
+    async def http_500(url, params=None):
+        return _FakeResp(status_code=500)
+    monkeypatch.setattr(svc._http, "get", http_500)
+    assert await svc.tag_top_tracks("workout") == []
+
+    async def error_payload(url, params=None):
+        return _FakeResp(payload={"error": 6, "message": "not found"})
+    monkeypatch.setattr(svc._http, "get", error_payload)
+    assert await svc.tag_top_tracks("workout") == []
+
+    async def transport_boom(url, params=None):
+        raise RuntimeError("network down")
+    monkeypatch.setattr(svc._http, "get", transport_boom)
+    assert await svc.tag_top_tracks("workout") == []
+    await svc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tag_top_tracks_no_key_or_empty_tag():
+    """Without an API key or with an empty tag the call short-circuits to []
+    before any HTTP (the same gate as the other Last.fm methods)."""
+    from services.metadata import MetadataService
+    svc = MetadataService("")
+    assert await svc.tag_top_tracks("workout") == []
+    svc2 = MetadataService("k")
+    assert await svc2.tag_top_tracks("   ") == []
+    await svc.aclose()
+    await svc2.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tag_top_tracks_cached_single_http_call(monkeypatch):
+    """Second call for the same tag (normalized cache key) -> a single HTTP
+    call (the day-TTL cache, the pattern of test_lastfm_cache_single_network_call)."""
+    from services.metadata import MetadataService
+    svc = MetadataService("k")
+    calls = {"n": 0}
+
+    async def fake_get(url, params=None):
+        calls["n"] += 1
+        return _FakeResp(payload=_lfm_tag_payload(
+            {"artist": "Survivor", "track": "Eye of the Tiger", "listeners": 500}))
+    monkeypatch.setattr(svc._http, "get", fake_get)
+
+    a = await svc.tag_top_tracks("Workout")
+    b = await svc.tag_top_tracks("workout ")  # cache key is normalized
+    assert a == b == [{"artist": "Survivor", "track": "Eye of the Tiger",
+                       "listeners": 500}]
+    assert calls["n"] == 1
+    await svc.aclose()
+
+
+# ════ MusicBrainz get_artist_bands (the B5 solo-career novelty probe) ════
+
+_MB_UA = "music-search-mate/1.0 (github.com/vonavikon/music-search-mate)"
+_GAHAN_MBID = "d547b148-cf1f-421b-9464-ce7411ba44b8"
+
+
+def _mb_search_payload(name, mbid, score=100):
+    """A MusicBrainz ws/2 artist-search JSON payload (top match only)."""
+    return {"artists": [{"id": mbid, "name": name, "score": score}]}
+
+
+def _mb_rels_payload():
+    """The live shape of Dave Gahan's artist-rels: 'member of band' and
+    'founder' both point at Depeche Mode, 'parent' at Stella Rose — only the
+    membership relation must be mapped."""
+    return {"relations": [
+        {"type": "founder", "target-type": "artist", "direction": "forward",
+         "artist": {"id": "b0pr9", "name": "Depeche Mode"}},
+        {"type": "member of band", "target-type": "artist", "direction": "forward",
+         "artist": {"id": "b0pr9", "name": "Depeche Mode"}},
+        {"type": "member of band", "target-type": "artist", "direction": "forward",
+         "artist": {"id": "s0uls", "name": "Soulsavers"}},
+        {"type": "parent", "target-type": "artist", "direction": "forward",
+         "artist": {"id": "st3ll", "name": "Stella Rose"}},
+        {"type": "member of band", "target-type": "url", "direction": "forward"},
+    ]}
+
+
+def _mb_http(search_resp=None, rels_resp=None):
+    """fake svc._http.get dispatching by URL: /artist?query=... -> the search
+    response, /artist/{mbid}?inc=artist-rels -> the rels response. Counts the
+    calls per endpoint and captures the headers (the UA etiquette contract)."""
+    state = {"search": 0, "rels": 0, "headers": []}
+
+    async def fake_get(url, params=None, headers=None):
+        state["headers"].append(headers)
+        if url.endswith("/artist") and "query" in (params or {}):
+            state["search"] += 1
+            return search_resp if search_resp is not None else _FakeResp(status_code=503)
+        if "/artist/" in url and (params or {}).get("inc") == "artist-rels":
+            state["rels"] += 1
+            return rels_resp if rels_resp is not None else _FakeResp(status_code=503)
+        return _FakeResp(status_code=404)
+    return fake_get, state
+
+
+@pytest.mark.asyncio
+async def test_get_artist_bands_maps_member_of_band(monkeypatch):
+    """Dave Gahan -> {'Depeche Mode', 'Soulsavers'}: only 'member of band'
+    relations count (founder/parent/url-target ignored), and every request
+    carries the descriptive MusicBrainz User-Agent."""
+    from services.metadata import MetadataService
+    svc = MetadataService("k")
+    fake_get, state = _mb_http(
+        search_resp=_FakeResp(payload=_mb_search_payload("Dave Gahan", _GAHAN_MBID)),
+        rels_resp=_FakeResp(payload=_mb_rels_payload()))
+    monkeypatch.setattr(svc._http, "get", fake_get)
+
+    out = await svc.get_artist_bands("Dave Gahan")
+    assert out == {"Depeche Mode", "Soulsavers"}
+    assert state["search"] == 1 and state["rels"] == 1
+    assert all(h and h.get("User-Agent") == _MB_UA for h in state["headers"])
+    await svc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_artist_bands_score_gate_no_rels_call(monkeypatch):
+    """A loose name match (score < 90) is a namesake risk: no rels call at
+    all, empty set (never attribute somebody else's memberships)."""
+    from services.metadata import MetadataService
+    svc = MetadataService("k")
+    fake_get, state = _mb_http(
+        search_resp=_FakeResp(payload=_mb_search_payload("Gahan", "other-mbid", score=80)))
+    monkeypatch.setattr(svc._http, "get", fake_get)
+
+    assert await svc.get_artist_bands("Gahan") == set()
+    assert state["search"] == 1 and state["rels"] == 0
+    await svc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_artist_bands_fail_soft(monkeypatch):
+    """Non-200 search, transport error, non-200 rels and an empty name all ->
+    an empty set (the probe degrades to a no-op, never raises)."""
+    from services.metadata import MetadataService
+    svc = MetadataService("k")
+
+    fake_get, _s = _mb_http(search_resp=_FakeResp(status_code=503))
+    monkeypatch.setattr(svc._http, "get", fake_get)
+    assert await svc.get_artist_bands("Dave Gahan") == set()
+
+    async def boom(url, params=None, headers=None):
+        raise RuntimeError("network down")
+    monkeypatch.setattr(svc._http, "get", boom)
+    assert await svc.get_artist_bands("Dave Gahan") == set()
+
+    fake_get2, _s2 = _mb_http(
+        search_resp=_FakeResp(payload=_mb_search_payload("Dave Gahan", _GAHAN_MBID)),
+        rels_resp=_FakeResp(status_code=503))
+    monkeypatch.setattr(svc._http, "get", fake_get2)
+    assert await svc.get_artist_bands("Dave Gahan") == set()
+
+    assert await svc.get_artist_bands("   ") == set()
+    await svc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_artist_bands_cached_single_lookup(monkeypatch):
+    """TTL cache: the second lookup of the same artist (normalized key) fires
+    ZERO new HTTP calls — the whole search+rels pair ran once."""
+    from services.metadata import MetadataService
+    svc = MetadataService("k")
+    fake_get, state = _mb_http(
+        search_resp=_FakeResp(payload=_mb_search_payload("Dave Gahan", _GAHAN_MBID)),
+        rels_resp=_FakeResp(payload=_mb_rels_payload()))
+    monkeypatch.setattr(svc._http, "get", fake_get)
+
+    a = await svc.get_artist_bands("Dave Gahan")
+    b = await svc.get_artist_bands("dave gahan ")  # cache key is normalized
+    assert a == b == {"Depeche Mode", "Soulsavers"}
+    assert state["search"] == 1 and state["rels"] == 1
+    await svc.aclose()
+
+
 @pytest.mark.asyncio
 async def test_artist_from_title_split(monkeypatch):
     """"Metrik - Gravity" -> the artist comes from the left part, validated via Last.fm."""

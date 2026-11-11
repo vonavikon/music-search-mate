@@ -133,6 +133,7 @@ class SearchTrace:
         self.description = description
         self._ctx = None
         self._root = None
+        self._tags: list[str] = []  # accumulated: root metadata holds the union
         if not _enabled:
             return
         try:
@@ -161,11 +162,16 @@ class SearchTrace:
                     model=model, model_parameters=model_parameters)
 
     def tag(self, tags: list[str]) -> None:
-        """Append tags to the trace (intent after extract) via root metadata."""
+        """Append tags to the trace (intent after extract, pipeline path
+        markers later) via root metadata. Accumulates across calls: a later
+        tag() must not drop tags set earlier (the intent tag)."""
         if self._root is None or not tags:
             return
+        for t in tags:
+            if t not in self._tags:
+                self._tags.append(t)
         try:
-            self._root.update(metadata={"tags": tags})
+            self._root.update(metadata={"tags": list(self._tags)})
         except Exception:
             pass
 

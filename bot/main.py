@@ -2,9 +2,11 @@
 
 python -m bot.main
 """
+import asyncio
 import logging
+import os
+import time
 
-from telegram import BotCommand
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (AIORateLimiter, Application, CallbackQueryHandler,
                           CommandHandler, MessageHandler, PreCheckoutQueryHandler, filters)
@@ -17,7 +19,7 @@ from services.media import MediaService
 from services.metadata import MetadataService
 from bot.handler import (handle_start, handle_help, handle_lang, handle_new, handle_message,
                         handle_callback, handle_unsupported, handle_stats, handle_donate,
-                        handle_precheckout, handle_payment)
+                        handle_precheckout, handle_payment, bot_commands)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,19 +32,88 @@ log = logging.getLogger("bot.main")
 
 async def post_init(app: Application) -> None:
     await init_db()
-    # Telegram command menu (the "/" button left of the input field)
-    try:
-        await app.bot.set_my_commands([
-            BotCommand("start", "найти трек по описанию или ссылке"),
-            BotCommand("help", "как искать и что значат кнопки"),
-            BotCommand("lang", "язык ответов"),
-            BotCommand("new", "начать поиск с чистого листа"),
-            BotCommand("stats", "цифры за сегодня"),
-            BotCommand("donate", "поддержать проект"),
-        ])
-    except Exception as e:
-        log.warning("set_my_commands failed: %s", e)
+    # Telegram command menu (the "/" button left of the input field).
+    # Both languages are registered on the default scope via language_code:
+    # the client picks the list by ITS interface locale. A third-locale
+    # client sees no hints (an RU/EN bot; the old behavior showed RU to
+    # everyone — deliberate change). A user who picks a language in /start
+    # gets a per-chat override (see the lang callback in bot/handler.py):
+    # the chat scope outranks the default-scope lists.
+    for code in ("ru", "en"):
+        try:
+            await app.bot.set_my_commands(bot_commands(code), language_code=code)
+        except Exception as e:
+            log.warning("set_my_commands(%s) failed: %s", code, e)
     log.info("db ready")
+    # plain asyncio task (not app.create_task): at post_init the application
+    # is not yet running and PTB would refuse to track it; the watchdog is
+    # self-contained and outlives nothing — the loop owns it
+    asyncio.create_task(_network_watchdog(app))
+
+
+# ---- fetcher-death watchdog (incident 08-10.11: mac twice, prod once) ----
+# After a long enough network storm the PTB update fetcher dies SILENTLY:
+# the process lives, the log goes quiet, users get no answers until a manual
+# restart. We cannot see the fetcher task from the public API, so we act on
+# the storm itself: count fetcher/update network errors, and once the storm
+# was heavy AND the network is back (getMe answers) — restart the process
+# preemptively. Docker (restart: always) and the dev wrapper loop bring it
+# back in seconds with a clean fetcher. Exit code 70 = "infrastructure,
+# restart me", same convention as EX_SOFTWARE friends.
+_NET_STORM = {"count": 0, "last_ts": 0.0}
+_STORM_TRIGGER = 15      # network errors after which the fetcher is suspect
+_STORM_MAX_AGE = 900.0   # ...and the storm must be recent (15 min)
+
+
+def _storm_restart_needed(storm: dict, get_me_ok: bool,
+                          now: float | None = None) -> bool:
+    """Pure decision: heavy recent storm + network back -> restart."""
+    now = now if now is not None else time.time()
+    recent = now - storm.get("last_ts", 0.0) <= _STORM_MAX_AGE
+    return bool(storm.get("count", 0) >= _STORM_TRIGGER and recent and get_me_ok)
+
+
+async def _network_watchdog(app: Application) -> None:
+    # black box for the silent-hang hunt (10.11): every pass snapshots the
+    # pending task set; a task PENDING for 3 consecutive passes (3+ minutes)
+    # that is not a known long-lived service gets its stack logged. The
+    # timeouts alone did not catch the 23:23 hang — this names the line.
+    prev_seen: dict[int, int] = {}
+    while True:
+        await asyncio.sleep(60)
+        try:
+            get_me_ok = bool(await app.bot.get_me())
+        except Exception:
+            get_me_ok = False  # network still down — weather, wait it out
+        if _storm_restart_needed(_NET_STORM, get_me_ok):
+            log.critical(
+                "watchdog: %d network errors in the last %.0fs and getMe "
+                "answers — the update fetcher is presumed dead, self-restarting",
+                _NET_STORM["count"], _STORM_MAX_AGE)
+            os._exit(70)
+        if get_me_ok:
+            _NET_STORM["count"] = 0  # healthy network resets the storm gauge
+        log.debug("watchdog ok: get_me=%s storm=%d", get_me_ok, _NET_STORM["count"])
+        # hang black box
+        seen_now: dict[int, int] = {}
+        for t in asyncio.all_tasks():
+            if t.done() or t is asyncio.current_task():
+                continue
+            name = repr(t.get_coro())
+            # NB: create_task_callback is PTB's wrapper for USER update
+            # processing — it must stay VISIBLE (the 10.11 hang lives there)
+            if any(s in name for s in ("_network_watchdog", "_pulse", "_action_loop",
+                                        "run_forever", "network_retry_loop",
+                                        "polling_action_cb", "_update_fetcher")):
+                continue  # long-lived service tasks
+            key = hash(name)
+            seen_now[key] = prev_seen.get(key, 0) + 1
+            if seen_now[key] == 3:
+                frames = [f"{f.f_code.co_filename.split('/')[-1]}:{f.f_lineno}"
+                          for f in t.get_stack(limit=4)]
+                log.warning("watchdog: task pending %d+ min: %s at %s",
+                            seen_now[key], name[:120], " <- ".join(frames) or "?")
+        prev_seen = seen_now
 
 
 async def handle_error(update: object, context) -> None:
@@ -56,9 +127,13 @@ async def handle_error(update: object, context) -> None:
     err = context.error
     upd_name = (update or {}).__class__.__name__
     if isinstance(err, TimedOut):
+        _NET_STORM["count"] += 1
+        _NET_STORM["last_ts"] = time.time()
         log.warning("network timeout (update=%s): %s", upd_name, err)
         return
     if isinstance(err, NetworkError):  # TimedOut is already filtered out above
+        _NET_STORM["count"] += 1
+        _NET_STORM["last_ts"] = time.time()
         log.warning("network error (update=%s): %s", upd_name, err)
         return
     if isinstance(err, RetryAfter):
@@ -99,6 +174,16 @@ def main():
                  environment=cfg.langfuse_environment)
 
     builder = Application.builder().token(cfg.bot_token)
+    # Explicit timeouts for EVERY environment (10.11 incident: a VPN flap
+    # half-closed the TCP connections and a cached-file send hung FOREVER —
+    # process alive, log clean, the track never delivered; the same silent
+    # class killed the fetcher twice). Defaults are short but not every
+    # request carried them; now they always do.
+    builder = builder.connect_timeout(10.0).read_timeout(30.0) \
+                      .write_timeout(30.0).pool_timeout(10.0) \
+                      .get_updates_connect_timeout(10.0) \
+                      .get_updates_read_timeout(25.0) \
+                      .get_updates_write_timeout(10.0)
     # local Bot API: files up to 2 GB (the standard API caps at 50 MB).
     # PTB 22.8: media_write_timeout finally exists (in 20.7 multipart had a
     # hardcoded 20s and builder-write had no effect) — now the 2GB upload is

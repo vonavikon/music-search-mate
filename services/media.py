@@ -9,7 +9,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -23,6 +25,66 @@ _log = logging.getLogger("bot.media")
 # (single-process bot), reset on restart. Error % is visible from the ok/fail pair in logs.
 _YTDLP_OK = 0
 _YTDLP_FAIL = 0
+
+# Deterministic binary: the interpreter's own environment (venv) ships the
+# pinned yt-dlp. A stale yt-dlp earlier in PATH (homebrew 2026.07 in dev)
+# silently broke the EJS challenge solver -> storyboards-only formats.
+_YTDLP_BIN = str(Path(sys.executable).parent / "yt-dlp")
+if not Path(_YTDLP_BIN).is_file():
+    _YTDLP_BIN = "yt-dlp"
+
+
+# Video quality: the handler's quality picker always passes the user's explicit
+# height (240-1440); this default only backs a malformed callback payload.
+# Belongs in config.py as VIDEO_DEFAULT_QUALITY (default "360") once config.py
+# is in scope for this change — module constant for now.
+_DEFAULT_VIDEO_QUALITY = "360"
+
+# Heights with the compact height-capped selectors (the picker's 240-480
+# buttons). Higher picks ("best", 720/1080/1440) keep the legacy cascade.
+_VIDEO_COMPACT_MAX_HEIGHT = 480
+
+# Step-down chain when a merged file still exceeds the size guard (~96% of the
+# --max-filesize limit, 48MB of the 50MB Bot API cap): re-fetching one step
+# lower is cheaper than an upload Telegram will reject.
+_VIDEO_FALLBACK_CHAIN = ("best", "480", "360", "240")
+
+
+def _norm_video_quality(quality: str) -> str:
+    """'360p'/'360' -> '360'; 'best'/''/anything non-numeric -> 'best'."""
+    q = (quality or "").strip().lower()
+    if q.endswith("p") and q[:-1].isdigit():
+        q = q[:-1]
+    return q if q.isdigit() else "best"
+
+
+def video_format(quality: str) -> str:
+    """yt-dlp -f selector for a quality label (unit-tested per quality).
+
+    240-480 (the picker's compact buttons): height-capped selectors — separate
+    mp4+m4a with a native merge, then any containers via an ffmpeg merge, then
+    a progressive stream. "best" and higher explicit heights (720/1080/1440):
+    today's codec cascade unchanged."""
+    q = _norm_video_quality(quality)
+    if q.isdigit() and int(q) <= _VIDEO_COMPACT_MAX_HEIGHT:
+        h = int(q)
+        return (f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]"
+                f"/bv*[height<={h}]+ba"
+                f"/b[height<={h}]")
+    h = int(q) if q.isdigit() else 720
+    return (f"best[height<={h}][ext=mp4]"
+            f"/bestvideo[height<={h}]+bestaudio"
+            f"/best[height<={h}]"
+            f"/best[ext=mp4]/best")
+
+
+def _filesize_bytes(spec: str) -> int:
+    """'50M' -> bytes ('2G' with a local Bot API server). Unparsable -> 50MB."""
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)B?\s*$", (spec or "").upper())
+    if not m:
+        return 50 * 1024 ** 2
+    mult = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}[m.group(2)]
+    return int(float(m.group(1)) * mult)
 
 
 def ytdlp_stats() -> dict:
@@ -103,39 +165,92 @@ class MediaService:
         self._vsem = asyncio.Semaphore(1)
         self._breaker = CircuitBreaker("yt-dlp", threshold=3, cooldown=60.0)
 
-    async def download_video(self, url: str, quality: str = "720p",
+    @staticmethod
+    def _ytdlp_net_args() -> list[str]:
+        """Shared network flags for every yt-dlp call.
+
+        EJS challenge solver: since 2026-11 YouTube returns storyboards-only
+        ("Requested format is not available") unless the n-challenge is solved;
+        the solver script is fetched from GitHub once and cached by yt-dlp.
+        Cookies: logged-in session passes the datacenter-IP bot-check;
+        without the file the flag is not added (previous behavior)."""
+        args = ["--remote-components", "ejs:github"]
+        cookies = os.getenv('YTDLP_COOKIEFILE')
+        if cookies and Path(cookies).exists():
+            args += ['--cookies', cookies]
+        return args
+
+    async def download_video(self, url: str, quality: str = _DEFAULT_VIDEO_QUALITY,
                              on_progress=None) -> tuple[str, dict]:
         """Download a VIDEO by URL at the given quality.
-        Returns (mp4_path, info_dict). Codec cascade avc1→vp9→av01."""
-        global _YTDLP_OK, _YTDLP_FAIL
+
+        quality: the height picked in the handler's picker ("240"-"1440") or
+        "best"; a trailing "p" from old dl:q buttons is tolerated. Size guard:
+        when the merged file exceeds ~96% of the --max-filesize limit (48MB of
+        the 50MB Bot API cap), the download steps one quality lower and
+        retries — unlikely at 240/360, the chain is best -> 480 -> 360 -> 240.
+        Returns (mp4_path, info_dict) where info gains "chosen_quality", the
+        label that actually produced the file."""
+        global _YTDLP_OK
         if self._breaker.is_open:
             raise RuntimeError("yt-dlp circuit open — download skipped")
-        dl_dir = Path(tempfile.mkdtemp(dir=TEMP_DIR, prefix="dl_v_"))
-        outtmpl = str(dl_dir / "%(id)s.%(ext)s")
-
-        height_map = {"240p": 240, "360p": 360, "480p": 480,
-                      "720p": 720, "1080p": 1080, "1440p": 1440}
-        h = height_map.get(quality, 720)
-        # format: video+audio in mp4 (native merge if available, otherwise an ffmpeg merge)
-        fmt = (f"best[height<={h}][ext=mp4]"
-               f"/bestvideo[height<={h}]+bestaudio"
-               f"/best[height<={h}]"
-               f"/best[ext=mp4]/best")
-
+        q = _norm_video_quality(quality)
+        if q in _VIDEO_FALLBACK_CHAIN:
+            chain = _VIDEO_FALLBACK_CHAIN[_VIDEO_FALLBACK_CHAIN.index(q):]
+        else:
+            # an explicit height above the chain (720/1080/1440 from old buttons):
+            # try it first, then step into the chain; 720 IS today's best selector,
+            # so don't run the same selector twice
+            tail = _VIDEO_FALLBACK_CHAIN
+            if video_format(q) == video_format("best"):
+                tail = tail[1:]
+            chain = (q,) + tail
         # With a local Bot API server the limit is 2 GB, without it 50 MB.
         # Env, not cfg: media.py doesn't know the bot config (single source — .env).
         max_fs = os.getenv("VIDEO_MAX_FILESIZE", "50M")
+        guard = int(_filesize_bytes(max_fs) * 0.96)  # ~48MB of the 50MB limit
+        path, info = "", {}
+        for step, ql in enumerate(chain):
+            path, info = await self._download_video_once(url, ql, max_fs, on_progress)
+            try:
+                size = Path(path).stat().st_size
+            except OSError:
+                size = 0
+            if size <= guard:
+                break
+            # over the guard even after the merge: drop the file and retry one
+            # step lower (the Bot API would reject the upload anyway)
+            shutil.rmtree(Path(path).parent, ignore_errors=True)
+            if step == len(chain) - 1:
+                raise RuntimeError(f"yt-dlp video: over {max_fs} even at {ql}p "
+                                   f"({size / 1_048_576:.0f} MB)")
+            _log.info("video %sp merged to %.0f MB (guard %.0f MB) — retrying one step lower",
+                      ql, size / 1_048_576, guard / 1_048_576)
+        _YTDLP_OK += 1
+        self._breaker.record_success()
+        info["chosen_quality"] = chain[step]
+        return path, info
+
+    async def _download_video_once(self, url: str, quality: str, max_fs: str,
+                                   on_progress=None) -> tuple[str, dict]:
+        """One yt-dlp video run at a fixed quality token. Raises RuntimeError on
+        any yt-dlp failure (FAIL counter + breaker, same as before); the
+        size-guard step-down lives in download_video."""
+        global _YTDLP_FAIL
+        dl_dir = Path(tempfile.mkdtemp(dir=TEMP_DIR, prefix="dl_v_"))
+        outtmpl = str(dl_dir / "%(id)s.%(ext)s")
+
+        # format: video+audio in mp4 (native merge if available, otherwise an ffmpeg merge)
+        fmt = video_format(quality)
         args = [
-            "yt-dlp", "--socket-timeout", "30",
+            _YTDLP_BIN, "--socket-timeout", "30",
             "-f", fmt,
             "--no-playlist", "--no-warnings", "--no-progress",
             "--write-info-json", "--merge-output-format", "mp4",
             "--max-filesize", max_fs,
             "-o", outtmpl, url,
         ]
-        cookies = os.getenv('YTDLP_COOKIEFILE')
-        if cookies and Path(cookies).exists():
-            args[1:1] = ['--cookies', cookies]
+        args[1:1] = self._ytdlp_net_args()
 
         # 2 GB at a slow transfer speed takes > 300s: the timeout must cover the limit's volume.
         # Live progress via _run_ytdlp ([download] X% into the status).
@@ -160,9 +275,6 @@ class MediaService:
             err = stderr.decode(errors="ignore")[-200:] if stderr else "?"
             shutil.rmtree(dl_dir, ignore_errors=True)  # garbage doesn't wait for TTL
             raise RuntimeError(f"yt-dlp video failed: {err}")
-
-        _YTDLP_OK += 1
-        self._breaker.record_success()
 
         mp4_path = None
         info = {}
@@ -214,19 +326,15 @@ class MediaService:
             "--extract-audio", "--audio-format", "m4a", "--audio-quality", "0",
         ]
         args = [
-            "yt-dlp", "--socket-timeout", "30",
+            _YTDLP_BIN, "--socket-timeout", "30",
             *audio_args,
             "--no-playlist", "--no-warnings",
             "--no-progress", "--write-thumbnail", "--convert-thumbnails", "jpg",
             "--write-info-json",
             "-o", outtmpl, url,
         ]
-        # Logged-in session cookies pass YouTube's datacenter-IP bot-check
-        # (LOGIN_REQUIRED wave since 2026-10-06). The file is mounted from ./secrets;
-        # no file -> the flag is not added, previous behavior.
-        cookies = os.getenv('YTDLP_COOKIEFILE')
-        if cookies and Path(cookies).exists():
-            args[1:1] = ['--cookies', cookies]
+        # Cookies + EJS solver via the shared helper (see _ytdlp_net_args).
+        args[1:1] = self._ytdlp_net_args()
 
         # Same fix as for video: swap --no-progress for --progress when a live
         # callback is set (otherwise [download] X% is not printed at all).
@@ -320,7 +428,8 @@ class MediaService:
         Returns {video_id, title, channel, duration} or None on failure.
         The existing download_audio then works from video_id — minimal new code.
         """
-        args = ["yt-dlp", "--socket-timeout", "30", "--dump-json", "--no-playlist", "--no-warnings", url]
+        args = [_YTDLP_BIN, "--socket-timeout", "30", "--dump-json", "--no-playlist",
+                "--no-warnings", *self._ytdlp_net_args(), url]
         async with self._sem:
             proc = await asyncio.create_subprocess_exec(
                 *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,

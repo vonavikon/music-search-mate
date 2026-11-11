@@ -10,6 +10,10 @@ Three sources, cheapest first:
   3. iTunes Search         - 600x600 artwork (a real album cover, not a music-video frame).
                              No key needed. Fallback to the yt-dlp thumbnail.
 
+Plus a keyless side probe (not part of the cascade):
+  4. MusicBrainz ws/2       - artist band memberships (get_artist_bands), the
+                             solo-career novelty filter of the surprise pipeline.
+
 TG-agnostic. Any external API failure never breaks the cascade: fall back to the
 layer below.
 """
@@ -24,6 +28,14 @@ from config import TEMP_DIR
 
 _log = logging.getLogger("bot.metadata")
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+
+# MusicBrainz ws/2 is open and keyless but REQUIRES a descriptive User-Agent
+# (the public service etiquette: contact info so abuse can be reported).
+_MB_BASE = "https://musicbrainz.org/ws/2"
+_MB_USER_AGENT = "music-search-mate/1.0 (github.com/vonavikon/music-search-mate)"
+# The artist-search gate: only a near-certain name match may feed the rels
+# lookup — a loose match would attribute somebody else's band memberships.
+_MB_SEARCH_MIN_SCORE = 90
 
 
 @dataclass
@@ -707,6 +719,130 @@ class MetadataService:
         except Exception as e:
             _log.debug("track.search skipped: %s", str(e)[:100])
             return []
+
+    async def tag_top_tracks(self, tag: str, limit: int = 6) -> list[dict]:
+        """tag.gettoptracks: the empirical pool for intent=mood — the real
+        tracks a Last.fm community tag stands for ("running", "sad"), instead
+        of pure LLM guesses. [{artist, track, listeners}] in the tag-chart
+        rank order; [] on a miss/without a key. The response is cached for a
+        day."""
+        if not self._lastfm_key or not (tag or "").strip():
+            return []
+        key = ("tagtoptracks", tag.strip().lower(), limit)
+        cached, hit = self._cache.get(key)
+        if hit:
+            return cached
+        result = await self._tag_top_tracks_uncached(tag, limit)
+        self._cache.put(key, result)
+        return result
+
+    async def _tag_top_tracks_uncached(self, tag: str, limit: int) -> list[dict]:
+        try:
+            r = await self._http.get(
+                "https://ws.audioscrobbler.com/2.0/",
+                params={
+                    "method": "tag.gettoptracks",
+                    "api_key": self._lastfm_key,
+                    "tag": tag.strip(),
+                    "limit": str(limit),
+                    "format": "json",
+                },
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            if "error" in data:
+                return []
+            tracks = data.get("tracks", {}).get("track") or []
+            if isinstance(tracks, dict):  # a single-track response
+                tracks = [tracks]
+            out = []
+            for t in tracks:
+                if not isinstance(t, dict):
+                    continue
+                artist = t.get("artist") or {}
+                artist = artist.get("name") if isinstance(artist, dict) else artist
+                name = (t.get("name") or "").strip()
+                artist = (artist or "").strip()
+                if not artist or not name:
+                    continue
+                try:
+                    listeners = int(t.get("listeners") or 0)
+                except (TypeError, ValueError):
+                    listeners = 0
+                out.append({"artist": artist, "track": name, "listeners": listeners})
+            return out
+        except Exception as e:
+            _log.debug("tag.gettoptracks skipped: %s", str(e)[:100])
+            return []
+
+    async def get_artist_bands(self, artist: str) -> set[str]:
+        """MusicBrainz ws/2: the BANDS `artist` is a member of ("member of
+        band" artist-rels, forward direction). The solo-career novelty probe
+        for intent=surprise: a getSimilar neighbor whose bands intersect the
+        user's hit artists is a disguised hit ("Dave Gahan" ->
+        {"Depeche Mode"}), not a discovery. Two HTTP calls per uncached name
+        (artist search by name -> artist-rels by mbid); empty set on any
+        miss, mismatch or outage (fail-soft: the caller proceeds without the
+        check). The result is cached for a day — band memberships are stable,
+        and repeat «удиви» runs re-probe the same neighbors."""
+        name = (artist or "").strip()
+        if not name:
+            return set()
+        key = ("mbbands", name.lower())
+        cached, hit = self._cache.get(key)
+        if hit:
+            return cached
+        result = await self._get_artist_bands_uncached(name)
+        self._cache.put(key, result)
+        return result
+
+    async def _get_artist_bands_uncached(self, artist: str) -> set[str]:
+        headers = {"User-Agent": _MB_USER_AGENT}
+        try:
+            # 1) resolve the name to an mbid: top search match, gated at a
+            # near-certain score so a namesake's memberships are never read.
+            r = await self._http.get(
+                f"{_MB_BASE}/artist",
+                params={"query": f'artist:"{artist}"', "fmt": "json"},
+                headers=headers,
+            )
+            if r.status_code != 200:
+                return set()
+            matches = (r.json() or {}).get("artists") or []
+            if not matches:
+                return set()
+            try:
+                score = int(matches[0].get("score") or 0)
+            except (TypeError, ValueError):
+                score = 0
+            mbid = (matches[0].get("id") or "").strip() if score >= _MB_SEARCH_MIN_SCORE else ""
+            if not mbid:
+                return set()
+            # 2) the rels lookup: only "member of band" forward relations —
+            # the other relation types (parent, founder, support...) are not
+            # band membership.
+            r2 = await self._http.get(
+                f"{_MB_BASE}/artist/{mbid}",
+                params={"inc": "artist-rels", "fmt": "json"},
+                headers=headers,
+            )
+            if r2.status_code != 200:
+                return set()
+            bands = set()
+            for rel in (r2.json() or {}).get("relations") or []:
+                if not isinstance(rel, dict):
+                    continue
+                if rel.get("type") != "member of band" or rel.get("target-type") != "artist":
+                    continue
+                target = rel.get("artist")
+                band = (target.get("name") or "").strip() if isinstance(target, dict) else ""
+                if band:
+                    bands.add(band)
+            return bands
+        except Exception as e:
+            _log.debug("musicbrainz bands skipped: %s", str(e)[:100])
+            return set()
 
     async def refetch_artwork(self, artist: str, track: str, video_id: str = "") -> str:
         """Artwork only, by the canonical artist/track pair — for cache hits of old

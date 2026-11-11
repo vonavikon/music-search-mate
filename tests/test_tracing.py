@@ -103,6 +103,22 @@ def test_trace_hierarchy_with_fake_client():
     assert root.updated.get("metadata") == {"tags": ["similar"]}
 
 
+def test_tag_accumulates_across_calls():
+    """tag() appends, never replaces: a later tag (a pipeline path marker
+    like "shortcut") must not drop the intent tag set earlier."""
+    fake = FakeClient()
+    assert tracing.init(_inject=fake) is True
+    t = SearchTrace("ab" * 16, 42, 100500, "ищу как Queen")
+    _, root = fake.traces[0]
+    t.tag(["this_track"])
+    t.tag(["shortcut"])
+    t.finish(output={"decision": "auto"})
+    assert root.updated.get("metadata") == {"tags": ["this_track", "shortcut"]}
+    # duplicates are not written twice
+    t.tag(["shortcut"])
+    assert root.updated.get("metadata") == {"tags": ["this_track", "shortcut"]}
+
+
 def test_score_feedback_guard_and_value():
     fake = FakeClient()
     tracing.init(_inject=fake)

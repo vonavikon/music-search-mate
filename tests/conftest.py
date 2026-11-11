@@ -138,6 +138,7 @@ def fake_config():
         langfuse_host="",
         langfuse_environment="development",
         allowed_user_ids=(),
+        bot_owner_id=0,
         search_daily_limit=500,
         url_daily_limit=500,
         global_daily_search_budget=1000,
@@ -196,5 +197,24 @@ def bothub_client(fake_config):
     return BothubClient(
         fake_config.bothub_base,
         fake_config.bothub_api_key,
-        fake_config.llm_model,
+        llm_model=fake_config.llm_model,
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_yt_suggest_network(monkeypatch):
+    """B3: the this_track pipeline calls YouTube's search-suggest endpoint
+    (services/suggest.py). Cut its HTTP layer for EVERY test — the suite is
+    hermetic, a down endpoint makes yt_suggest fail-soft to []. Tests that
+    exercise suggest patch services.suggest._fetch / yt_suggest themselves;
+    the cache is reset around each test so cached results never leak between
+    tests."""
+    from services import suggest as suggest_mod
+
+    async def _offline(query, timeout):
+        return None
+
+    monkeypatch.setattr(suggest_mod, "_fetch", _offline)
+    suggest_mod._CACHE.clear()
+    yield
+    suggest_mod._CACHE.clear()

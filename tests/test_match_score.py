@@ -156,6 +156,44 @@ class TestScoreCandidate:
         assert not any("dur" in r for r in result.reasons)
 
 
+class TestReferenceDisqualification:
+    """Doctrine s3 double-check: a candidate whose channel IS the reference
+    artist is never a valid similar answer — match_score 0.0 whatever the
+    LLM score, so auto-download and the ambiguity gap can't be fooled by a
+    banned-but-LLM-loved reference."""
+
+    REF = _norm("The Moody Blues")
+
+    def test_reference_channel_zeroed(self):
+        # 0.95 LLM + topic + fidelity + views would clear AUTO_SIMILAR (0.85)
+        c = _c("Nights in White Satin", "The Moody Blues - Topic", dur=280, views=900000)
+        result = score_candidate(c, {}, "similar", 0.95, ref_key=self.REF)
+        assert result.score == 0.0
+        assert any("reference-artist disqualified" in r for r in result.reasons)
+
+    def test_reference_channel_bare_name(self):
+        # the '- Topic' suffix is optional — a bare channel name matches too
+        c = _c("Nights in White Satin", "The Moody Blues", dur=280, views=900000)
+        result = score_candidate(c, {}, "similar", 0.95, ref_key=self.REF)
+        assert result.score == 0.0
+
+    def test_genre_mate_not_penalized(self):
+        # same era/genre, NOT the reference artist and NOT a neighbor: no
+        # genre bonus exists (verified — score_candidate has no genre term),
+        # and the ref_key disqualification must not leak onto it either
+        c = _c("A Whiter Shade of Pale", "Procol Harum - Topic", dur=240, views=900000)
+        with_ref = score_candidate(c, {}, "similar", 0.85, ref_key=self.REF)
+        without_ref = score_candidate(c, {}, "similar", 0.85)
+        assert with_ref.score == without_ref.score
+        assert not any("reference-artist" in r for r in with_ref.reasons)
+
+    def test_empty_ref_key_disables_check(self):
+        # ref_key="" (non-similar ranks, callers without a reference): off
+        c = _c("Nights in White Satin", "The Moody Blues - Topic", dur=280, views=900000)
+        result = score_candidate(c, {}, "similar", 0.95)
+        assert result.score > 0.0
+
+
 class TestShouldAutoDownload:
     def test_this_track_above_threshold(self):
         assert should_auto_download("this_track", 0.70) is True

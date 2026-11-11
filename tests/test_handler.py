@@ -22,6 +22,23 @@ from services.llm_search import Candidate, SearchOut
 
 # ════ helpers ════
 
+@pytest.fixture(autouse=True)
+def _hermetic_usage(monkeypatch):
+    """Zero the daily usage counters for every handler test. services.store
+    binds config.DB_PATH at import, so tests without the db_path fixture
+    read the developer DB's accumulated counters; after enough local
+    full-suite runs user 123 crosses the sends cap and sim/limit-free paths
+    silently return before _do_search (the TestFunnel46 hermeticity class).
+    Tests that model limit behaviour patch get_usage/incr_usage themselves
+    and override this default."""
+    monkeypatch.setattr(
+        "bot.handler.get_usage",
+        AsyncMock(return_value={"searches": 0, "urls": 0, "sends": 0,
+                                "facts": 0, "bytes_sent": 0}))
+
+
+
+
 def _text_update(text, user_id=123, chat_id=456):
     user = User(id=user_id, is_bot=False, first_name="Test")
     chat = Chat(id=chat_id, type="private")
@@ -686,6 +703,69 @@ class TestAllowlist:
         assert _denied(upd, ctx) is False
 
 
+# ════ owner gate (/stats) ════
+
+class TestOwnerGate:
+    def _cfg(self, fake_config, **kw):
+        from types import SimpleNamespace
+        return SimpleNamespace(**{**fake_config.__dict__, **kw})
+
+    def test_not_owner_denied(self, fake_config):
+        from types import SimpleNamespace
+        from bot.handler import _not_owner
+        ctx = SimpleNamespace(bot_data={"cfg": self._cfg(fake_config, bot_owner_id=111)})
+        upd = SimpleNamespace(effective_user=SimpleNamespace(id=222))
+        assert _not_owner(upd, ctx) is True
+        upd_ok = SimpleNamespace(effective_user=SimpleNamespace(id=111))
+        assert _not_owner(upd_ok, ctx) is False
+
+    def test_unset_owner_checks_nothing(self, fake_config):
+        """BOT_OWNER_ID=0 -> no extra check beyond the allowlist gate."""
+        from types import SimpleNamespace
+        from bot.handler import _not_owner
+        ctx = SimpleNamespace(bot_data={"cfg": self._cfg(fake_config, bot_owner_id=0)})
+        upd = SimpleNamespace(effective_user=SimpleNamespace(id=999))
+        assert _not_owner(upd, ctx) is False
+
+    @pytest.mark.asyncio
+    async def test_stats_renders_for_owner(self, fake_config):
+        """Regression 04.11: a stray comma after the stats_all term made the
+        next line's '+ "\\n"' a unary plus — every /stats crashed with
+        TypeError before replying. The owner call must render one string."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        from bot.handler import handle_stats
+        cfg = self._cfg(fake_config, allowed_user_ids=(111,), bot_owner_id=111)
+        reply = AsyncMock()
+        upd = SimpleNamespace(effective_user=SimpleNamespace(id=111),
+                              message=SimpleNamespace(reply_text=reply))
+        ctx = SimpleNamespace(bot_data={"cfg": cfg})
+        with patch("bot.handler.get_user_lang", AsyncMock(return_value="ru")), \
+             patch("bot.handler.get_global_usage", AsyncMock(return_value={})), \
+             patch("bot.handler.funnel_today",
+                   AsyncMock(return_value={"outcomes": {}, "events": {}, "feedback": {}})):
+            await handle_stats(upd, ctx)
+        reply.assert_awaited_once()
+        args, kwargs = reply.await_args
+        assert isinstance(args[0], str) and args[0]
+        assert kwargs.get("parse_mode") == "HTML"
+
+    @pytest.mark.asyncio
+    async def test_stats_silent_for_non_owner(self, fake_config):
+        """/stats is owner-only: an allowlisted non-owner gets no reply."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        from bot.handler import handle_stats
+        cfg = self._cfg(fake_config, allowed_user_ids=(111, 222), bot_owner_id=111)
+        reply = AsyncMock()
+        upd = SimpleNamespace(effective_user=SimpleNamespace(id=222),
+                              message=SimpleNamespace(reply_text=reply))
+        ctx = SimpleNamespace(bot_data={"cfg": cfg})
+        with patch("bot.handler.get_user_lang", AsyncMock(return_value="ru")):
+            await handle_stats(upd, ctx)
+        reply.assert_not_awaited()
+
+
 # ════ sim cache ════
 
 @pytest.mark.asyncio
@@ -1335,3 +1415,800 @@ class TestSplitYtReference:
         from bot.handler import _split_yt_reference
         assert _split_yt_reference(
             "The Best Slide Guitar Blues Ballads Of All Times - Dior wild man")[0] == ""
+
+
+# ════ download-fallback quality gate (prod case 04.11 "дип перпл кинг оф дримс") ════
+
+async def _run_finish_search(app, out, media, cached_row=None, meta_ret=None,
+                             photo_se=None, audio_se=None):
+    """Drive _finish_search (the text-search path) directly with a stub media layer.
+    Returns (context, status) for send/edit assertions. cached_row simulates a
+    tg file_id cache hit; meta_ret overrides the metadata resolve result;
+    photo_se/audio_se attach side effects to the card photo / audio sends
+    (ordering proofs for the audio head start)."""
+    from bot.handler import _finish_search
+    from services.metadata import MetaOut
+
+    # PTB Chat is frozen (no attribute overrides) — a mock chat carries the
+    # sends the head-start path makes (card photo / failure text)
+    update = MagicMock()
+    update.effective_user = User(id=123, is_bot=False, first_name="Test")
+    update.effective_chat = MagicMock()
+    update.effective_chat.id = 456
+    update.effective_chat.send_photo = AsyncMock(side_effect=photo_se)
+    update.effective_chat.send_message = AsyncMock()
+
+    meta = MagicMock()
+    meta.resolve = AsyncMock(return_value=meta_ret or MetaOut(artist="Deep Purple", track="King of Dreams"))
+    meta.refetch_artwork = AsyncMock(return_value="")  # artwork re-fetch on a cache hit
+    context = MagicMock()
+    # no cfg -> _is_degraded False; no bothub -> _sonar_fact returns "" without LLM
+    context.bot_data = {"media": media, "metadata": meta}
+    context.chat_data = {}
+    context.bot.send_audio = AsyncMock(side_effect=audio_se)
+    status = AsyncMock()
+
+    with _patch_store(), \
+         patch("bot.handler.get_cached_file", AsyncMock(return_value=cached_row)), \
+         patch("bot.handler.insert_query", AsyncMock(return_value=1)), \
+         patch("bot.handler.incr_usage", AsyncMock()), \
+         patch("bot.handler.insert_event", AsyncMock()), \
+         patch("bot.handler.upsert_session", AsyncMock()), \
+         patch("bot.handler.tag_enrichment.enrich"), \
+         patch("bot.handler.get_user_lang", AsyncMock(return_value="ru")):
+        await _finish_search(update, context, status, out, "test query",
+                             update.effective_user)
+    return context, status
+
+
+def _status_texts(status):
+    return " | ".join(str(c.args[0]) for c in status.edit_text.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_fallback_gate_blocks_much_worse_candidate(app, tmp_path):
+    """The 04.11 case: the best match (score 1.0) fails with HTTP 403 and the next
+    candidate scores 0.3 — a wrong musical must NOT be delivered silently. The user
+    gets the honest dl_refused text naming the promised track; no audio is sent."""
+    m4a = tmp_path / "ok.m4a"
+    m4a.write_bytes(b"x")
+
+    async def _dl(url, on_progress=None):
+        if "vbest" in url:
+            raise RuntimeError("HTTP Error 403: Forbidden")
+        return str(m4a), None, {"id": "vwrong", "title": "Wrong", "uploader": "X"}
+
+    media = MagicMock()
+    media.download_audio = AsyncMock(side_effect=_dl)
+    out = _fake_search_out(candidates=[
+        Candidate("vbest", "Deep Purple - King of Dreams", "Deep Purple - Topic",
+                  260, 10 ** 6, score=1.0, match_score=0.9),
+        Candidate("vwrong", "Joseph King of Dreams musical", "Dreamworks",
+                  240, 10 ** 5, score=0.3, match_score=0.3),
+    ], best_index=0)
+    out.trace = MagicMock()
+
+    context, status = await _run_finish_search(app, out, media)
+
+    # the much-worse candidate was never even downloaded, and no audio went out
+    dl_urls = [str(c.args[0]) for c in media.download_audio.await_args_list]
+    assert len(dl_urls) == 1 and "vbest" in dl_urls[0]
+    context.bot.send_audio.assert_not_awaited()
+    # the honest text names the best (failed) candidate's clean title
+    texts = _status_texts(status)
+    assert "Нашёл" in texts and "King of Dreams" in texts and "YouTube" in texts
+    # the dead end is traceable
+    outputs = [c.kwargs["output"] for c in out.trace.finish.call_args_list]
+    assert {"decision": "download-refused-quality",
+            "best": "Deep Purple - King of Dreams"} in outputs
+
+
+@pytest.mark.asyncio
+async def test_fallback_within_tolerance_still_delivers(app, tmp_path):
+    """A next candidate 0.3 below the best (within _DROP_TOLERANCE=0.35) is a
+    comparable match and is still delivered after the best fails to download."""
+    from bot.handler import _DROP_TOLERANCE
+    m4a = tmp_path / "ok.m4a"
+    m4a.write_bytes(b"x")
+
+    async def _dl(url, on_progress=None):
+        if "vbest" in url:
+            raise RuntimeError("HTTP Error 403: Forbidden")
+        return str(m4a), None, {"id": "vsecond", "title": "Second", "uploader": "X"}
+
+    media = MagicMock()
+    media.download_audio = AsyncMock(side_effect=_dl)
+    out = _fake_search_out(candidates=[
+        Candidate("vbest", "Deep Purple - King of Dreams", "Deep Purple - Topic",
+                  260, 10 ** 6, score=1.0, match_score=0.9),
+        Candidate("vsecond", "Deep Purple - King of Dreams live", "Deep Purple - Topic",
+                  260, 10 ** 5, score=1.0 - _DROP_TOLERANCE + 0.05, match_score=0.85),
+    ], best_index=0)
+
+    context, status = await _run_finish_search(app, out, media)
+
+    assert media.download_audio.await_count == 2  # best failed, second tried
+    context.bot.send_audio.assert_awaited_once()
+    assert "не даёт его скачать" not in _status_texts(status)  # delivered, not refused
+
+
+@pytest.mark.asyncio
+async def test_all_within_tolerance_fail_says_refused_with_title(app, tmp_path):
+    """Best and a within-tolerance next candidate both fail to download: the chain
+    is exhausted, dl_refused names the promised track (the good one is here but
+    undownloadable), and both candidates were actually attempted."""
+    media = MagicMock()
+    media.download_audio = AsyncMock(side_effect=RuntimeError("HTTP Error 403: Forbidden"))
+    out = _fake_search_out(candidates=[
+        Candidate("vbest", "Deep Purple - King of Dreams", "Deep Purple - Topic",
+                  260, 10 ** 6, score=1.0, match_score=0.9),
+        Candidate("vsecond", "Deep Purple - King of Dreams live", "Deep Purple - Topic",
+                  260, 10 ** 5, score=0.8, match_score=0.85),
+    ], best_index=0)
+
+    context, status = await _run_finish_search(app, out, media)
+
+    assert media.download_audio.await_count == 2  # both were tried, both failed
+    context.bot.send_audio.assert_not_awaited()
+    texts = _status_texts(status)
+    assert "Нашёл" in texts and "King of Dreams" in texts
+
+
+@pytest.mark.asyncio
+async def test_all_fail_with_nothing_close_keeps_dl_none(app):
+    """A garbage pool (even the best scored below _DROP_TOLERANCE) with every
+    download failing keeps the generic dl_none text: nothing was even close,
+    so there is no title worth naming."""
+    from bot.handler import _DROP_TOLERANCE
+    media = MagicMock()
+    media.download_audio = AsyncMock(side_effect=RuntimeError("HTTP Error 403: Forbidden"))
+    out = _fake_search_out(candidates=[
+        Candidate("v1", "Barely Relevant", "X", 200, 10 ** 4,
+                  score=_DROP_TOLERANCE - 0.15, match_score=0.2),
+        Candidate("v2", "Also Weak", "Y", 180, 10 ** 4,
+                  score=_DROP_TOLERANCE - 0.25, match_score=0.2),
+    ], best_index=0)
+
+    context, status = await _run_finish_search(app, out, media)
+
+    context.bot.send_audio.assert_not_awaited()
+    texts = _status_texts(status)
+    assert "Не смог скачать ни один из вариантов" in texts
+    assert "Нашёл" not in texts
+
+
+@pytest.mark.asyncio
+async def test_direct_url_download_keeps_single_candidate(app, fake_config):
+    """The direct_url path (the user pressed Audio under an explicit link) is NOT
+    covered by the tolerance gate: it downloads THAT video only — exactly one
+    _send_track call with a single-candidate list, no next-candidate fallback."""
+    cq = MagicMock()
+    cq.data = "dl:aud:vurl1234567"
+    cq.answer = AsyncMock()
+    cq.edit_message_text = AsyncMock()
+    cq.message.reply_text = AsyncMock()
+    update = MagicMock()
+    update.callback_query = cq
+    update.effective_user = User(id=123, is_bot=False, first_name="Test")
+    update.effective_chat.id = 456
+    context = MagicMock()
+    context.bot_data = {"cfg": fake_config, "media": MagicMock()}
+    context.chat_data = {"url:vurl1234567": {"url": "https://youtu.be/vurl1234567",
+                                             "title": "Some Track", "channel": "Ch"}}
+
+    with patch("bot.handler.insert_query", AsyncMock(return_value=1)), \
+         patch("bot.handler.save_query_state", AsyncMock()), \
+         patch("bot.handler.incr_usage", AsyncMock()), \
+         patch("bot.handler.insert_event", AsyncMock()), \
+         patch("bot.handler._send_track", new=AsyncMock(return_value=False)) as ms:
+        await handle_callback(update, context)
+
+    assert ms.await_count == 1  # no fallback loop on the URL path
+    cands = ms.await_args.args[6]
+    assert len(cands) == 1 and cands[0].video_id == "vurl1234567"
+
+
+# ════ audio head start (UX fix 04.11: download in parallel with the card) ════
+
+@pytest.mark.asyncio
+async def test_head_start_cached_file_id_skips_download(app, tmp_path):
+    """(a) Cached tg file_id: no download task at all — the head start is gated
+    by the cheap cache pre-check, the audio goes out by file_id immediately."""
+    cached = {"file_id": "file-cached", "artist": "Deep Purple", "track": "King of Dreams",
+              "album": "", "year": "", "genre": "", "bio": "", "artwork_url": ""}
+    media = MagicMock()
+    media.download_audio = AsyncMock()  # must never run
+
+    out = _fake_search_out(candidates=[
+        Candidate("vbest", "Deep Purple - King of Dreams", "Deep Purple - Topic",
+                  260, 10 ** 6, score=1.0, match_score=0.9)], best_index=0)
+
+    context, status = await _run_finish_search(app, out, media, cached_row=cached)
+
+    media.download_audio.assert_not_awaited()  # no download task was started
+    context.bot.send_audio.assert_awaited_once()
+    assert context.bot.send_audio.await_args.kwargs["audio"] == "file-cached"
+    # and nothing download-shaped is left spinning in the loop
+    leftovers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    await asyncio.wait_for(asyncio.gather(*leftovers, return_exceptions=True), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_head_start_download_runs_before_card_completes(app, tmp_path):
+    """(b) Ordering proof: on an uncached track the download is ALREADY RUNNING
+    (started, not finished) while the card send is still in flight — a slow mock
+    card send that yields sees exactly that. The card lands first, the audio
+    follows carrying the very file the parallel download produced."""
+    import time as _time
+
+    m4a = tmp_path / "vbest.m4a"
+    m4a.write_bytes(b"HEADSTART-AUDIO")
+    cover = tmp_path / "vbest_cover.jpg"
+    cover.write_bytes(b"\xff\xd8\xff\xe0cover")  # local artwork: no HTTP in the test
+
+    started, finished = asyncio.Event(), asyncio.Event()
+    marks = {}  # monotonic timestamps of each stage
+
+    async def _dl(url, on_progress=None):
+        started.set()
+        marks["dl_start"] = _time.monotonic()
+        await asyncio.sleep(0.25)  # slower than the card send
+        if on_progress:
+            await on_progress(60.0)
+        finished.set()
+        marks["dl_done"] = _time.monotonic()
+        return str(m4a), None, {"id": "vbest", "title": "Deep Purple - King of Dreams",
+                                "uploader": "Deep Purple - Topic"}
+
+    card_state = []  # (download_started, download_finished) observed inside the card send
+
+    async def _slow_card(**kwargs):
+        marks["photo_enter"] = _time.monotonic()
+        await asyncio.sleep(0.05)  # the slow card send that yields to the loop
+        card_state.append((started.is_set(), finished.is_set()))
+        marks["photo_done"] = _time.monotonic()
+        return MagicMock()  # a sent photo Message (keeps the fallback photo off)
+
+    audio_payload = {}
+
+    async def _audio_send(**kwargs):
+        marks["audio"] = _time.monotonic()
+        audio_payload["bytes"] = m4a.read_bytes()  # the file is still there at send time
+        audio_payload["filename"] = kwargs["audio"].filename
+
+    media = MagicMock()
+    media.download_audio = AsyncMock(side_effect=_dl)
+
+    out = _fake_search_out(candidates=[
+        Candidate("vbest", "Deep Purple - King of Dreams", "Deep Purple - Topic",
+                  260, 10 ** 6, score=1.0, match_score=0.9)], best_index=0)
+
+    from services.metadata import MetaOut
+    context, status = await _run_finish_search(
+        app, out, media,
+        meta_ret=MetaOut(artist="Deep Purple", track="King of Dreams",
+                         artwork_path=str(cover)),
+        photo_se=_slow_card, audio_se=_audio_send)
+
+    # the download was running (not finished) while the card send was in flight;
+    # the old sequential code would record (True, True) — photo after a DONE download
+    assert card_state == [(True, False)]
+    # the card went out before the download finished, the audio followed after it
+    assert marks["photo_enter"] < marks["dl_done"] < marks["audio"]
+    assert marks["photo_done"] < marks["audio"]
+    # exactly one card photo and one audio carrying the downloaded file
+    assert media.download_audio.await_count == 1
+    assert audio_payload["bytes"] == b"HEADSTART-AUDIO"
+    assert audio_payload["filename"].endswith(".m4a")
+
+
+@pytest.mark.asyncio
+async def test_head_start_gate_refusal_no_leaked_task(app, tmp_path):
+    """(c) Best download fails, the next candidate is outside _DROP_TOLERANCE:
+    dl_refused lands, the gate holds (only the best was ever downloaded) and the
+    head-start task is fully settled — gather over the leftovers returns at once."""
+    media = MagicMock()
+    media.download_audio = AsyncMock(side_effect=RuntimeError("HTTP Error 403: Forbidden"))
+    out = _fake_search_out(candidates=[
+        Candidate("vbest", "Deep Purple - King of Dreams", "Deep Purple - Topic",
+                  260, 10 ** 6, score=1.0, match_score=0.9),
+        Candidate("vwrong", "Joseph King of Dreams musical", "Dreamworks",
+                  240, 10 ** 5, score=0.3, match_score=0.3),
+    ], best_index=0)
+
+    context, status = await _run_finish_search(app, out, media)
+
+    dl_urls = [str(c.args[0]) for c in media.download_audio.await_args_list]
+    assert len(dl_urls) == 1 and "vbest" in dl_urls[0]  # gate: the runner-up was never fetched
+    context.bot.send_audio.assert_not_awaited()
+    texts = _status_texts(status)
+    assert "Нашёл" in texts and "King of Dreams" in texts  # honest dl_refused
+    # no leaked download task: everything the handler spawned has settled
+    leftovers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    await asyncio.wait_for(asyncio.gather(*leftovers, return_exceptions=True), timeout=2)
+    assert media.download_audio.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_head_start_slow_mode_behavior_unchanged(app, tmp_path):
+    """(d) Slow-mode group: the audio send still goes through _send_with_slow_mode —
+    a repeated RetryAfter raises _SlowModeRefused and the head-started temp file
+    is cleaned up by the existing finally."""
+    from bot.handler import _SlowModeRefused, _send_track
+    from services.metadata import MetaOut
+    from telegram.error import RetryAfter
+
+    m4a = tmp_path / "v1.m4a"
+    m4a.write_bytes(b"x")
+
+    track = Candidate("v1", "Test Track", "Test Artist", 200, 1000, url="https://a.example/v1")
+    media = MagicMock()
+    media.download_audio = AsyncMock(return_value=(str(m4a), None, {"id": "v1"}))
+    meta = MagicMock()
+    meta.resolve = AsyncMock(return_value=MetaOut(artist="Test Artist", track="Test Track"))
+
+    context = MagicMock()
+    context.bot_data = {"metadata": meta}
+    context.chat_data = {}
+
+    async def _refused(**kwargs):
+        raise RetryAfter(15)
+
+    context.bot.send_audio = AsyncMock(side_effect=_refused)
+
+    update = _text_update("test")
+    update.set_bot(app.bot)
+    update.message.set_bot(app.bot)
+    update.effective_chat.set_bot(app.bot)
+
+    status = AsyncMock()
+    # a sleep mock that REALLY yields (a bare AsyncMock never suspends, so the
+    # upload-indicator loop would busy-spin and never process its cancellation)
+    _real_sleep = asyncio.sleep
+
+    async def _fast_sleep(_delay=None, **_kw):
+        await _real_sleep(0)
+
+    with _patch_store(), patch("bot.handler.tag_enrichment.enrich"), \
+         patch("bot.handler.upsert_session", AsyncMock()), \
+         patch("bot.handler.asyncio.sleep", new=_fast_sleep), \
+         patch("bot.handler._t", new=AsyncMock(return_value="slow")):
+        with pytest.raises(_SlowModeRefused):
+            await _send_track(update, context, status, media, 1, 0, [track], track, "high")
+
+    assert media.download_audio.await_count == 1  # the head start ran, no extra fetches
+    assert not m4a.exists()  # temp file cleaned despite the refusal
+
+
+@pytest.mark.asyncio
+async def test_head_start_progress_edits_during_parallel_download(app, tmp_path):
+    """(e) While the download runs in parallel with the card, the status message
+    still shows honest «⬇️ N%» progress via the existing dl_bar mechanism."""
+    m4a = tmp_path / "vbest.m4a"
+    m4a.write_bytes(b"x")
+
+    async def _dl(url, on_progress=None):
+        for pct in (10.0, 45.0, 80.0):
+            if on_progress:
+                await on_progress(pct)
+        return str(m4a), None, {"id": "vbest"}
+
+    media = MagicMock()
+    media.download_audio = AsyncMock(side_effect=_dl)
+    out = _fake_search_out(candidates=[
+        Candidate("vbest", "Deep Purple - King of Dreams", "Deep Purple - Topic",
+                  260, 10 ** 6, score=1.0, match_score=0.9)], best_index=0)
+
+    context, status = await _run_finish_search(app, out, media)
+
+    texts = _status_texts(status)
+    assert "⬇️" in texts and "45%" in texts  # honest progress while the card is out
+    context.bot.send_audio.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lang_choice_sends_greeting(app, fake_config):
+    """Prod report 2026-11-04: after choosing a language the greeting never
+    arrived. The callback must send it right after the ✅ edit."""
+    from bot.handler import handle_callback
+    cq = MagicMock()
+    cq.data = "lang:ru"
+    cq.answer = AsyncMock()
+    cq.edit_message_text = AsyncMock()
+    cq.message = MagicMock()
+    cq.message.reply_photo = AsyncMock()
+
+    update = MagicMock()
+    update.callback_query = cq
+    update.effective_user = User(id=707, is_bot=False, first_name="Test")
+    context = MagicMock()
+    context.bot_data = {"cfg": fake_config, "media": MagicMock()}
+    context.chat_data = {}
+
+    with patch("bot.handler.set_user_lang", new=AsyncMock()):
+        await handle_callback(update, context)
+
+    cq.edit_message_text.assert_awaited_once()
+    assert "Русский" in cq.edit_message_text.await_args.args[0]
+    cq.message.reply_photo.assert_awaited_once()
+    caption = cq.message.reply_photo.await_args.kwargs.get("caption", "")
+    assert caption, "greeting caption must follow the language choice"
+
+
+def _lang_callback_mocks(data, user_id, cfg):
+    """Update/context pair for the language-choice callback with a
+    set_my_commands spy on context.bot."""
+    cq = MagicMock()
+    cq.data = data
+    cq.answer = AsyncMock()
+    cq.edit_message_text = AsyncMock()
+    cq.message = MagicMock()
+    cq.message.reply_photo = AsyncMock()
+
+    update = MagicMock()
+    update.callback_query = cq
+    update.effective_user = User(id=user_id, is_bot=False, first_name="Test")
+    context = MagicMock()
+    context.bot_data = {"cfg": cfg, "media": MagicMock()}
+    context.chat_data = {}
+    context.bot.set_my_commands = AsyncMock()
+    return cq, update, context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice,lang", [("lang:en", "en"), ("lang:ru", "ru")])
+async def test_lang_choice_updates_command_menu(app, fake_config, choice, lang):
+    """Live-test F1: picking a language must also switch the "/" command menu
+    for that chat: BotCommandScopeChat scope + the chosen language's list."""
+    from bot.handler import handle_callback, bot_commands
+    from telegram import BotCommandScopeChat
+
+    cq, update, context = _lang_callback_mocks(choice, user_id=709, cfg=fake_config)
+
+    with patch("bot.handler.set_user_lang", new=AsyncMock()) as set_lang:
+        await handle_callback(update, context)
+
+    set_lang.assert_awaited_once_with(709, lang)
+    context.bot.set_my_commands.assert_awaited_once()
+    call = context.bot.set_my_commands.await_args
+    cmds = call.kwargs.get("commands") or call.args[0]
+    scope = call.kwargs.get("scope") or (call.args[1] if len(call.args) > 1 else None)
+    assert isinstance(scope, BotCommandScopeChat)
+    assert scope.chat_id == 709  # per-chat override, wins over client locale
+    assert "language_code" not in call.kwargs  # chosen language applies to any client locale
+    got = [(c.command, c.description) for c in cmds]
+    assert got == [(c.command, c.description) for c in bot_commands(lang)]
+    cq.message.reply_photo.assert_awaited_once()  # greeting still follows
+
+
+@pytest.mark.asyncio
+async def test_lang_choice_menu_failure_does_not_block_greeting(app, fake_config):
+    """A set_my_commands hiccup must never fail the callback or eat the
+    greeting (failure-tolerant wrap, log debug)."""
+    from bot.handler import handle_callback
+
+    cq, update, context = _lang_callback_mocks("lang:en", user_id=710, cfg=fake_config)
+    context.bot.set_my_commands = AsyncMock(side_effect=RuntimeError("api hiccup"))
+
+    with patch("bot.handler.set_user_lang", new=AsyncMock()):
+        await handle_callback(update, context)  # must not raise
+
+    cq.edit_message_text.assert_awaited_once()
+    cq.message.reply_photo.assert_awaited_once()
+    caption = cq.message.reply_photo.await_args.kwargs.get("caption", "")
+    assert caption, "greeting must survive a set_my_commands failure"
+
+
+def test_bot_commands_localized_lists():
+    """Startup registration source: RU and EN lists exist, carry the same
+    command names in the same order, and descriptions are localized."""
+    from bot.handler import bot_commands
+    from telegram import BotCommand
+
+    ru, en = bot_commands("ru"), bot_commands("en")
+    assert ru and en
+    assert all(isinstance(c, BotCommand) for c in ru + en)
+    assert [c.command for c in ru] == [c.command for c in en]
+    assert {"start", "help", "lang", "new", "stats", "donate"} <= {c.command for c in ru}
+    for r, e in zip(ru, en):
+        assert r.description and e.description
+        assert r.description != e.description  # actually localized, not copies
+        for d in (r.description, e.description):
+            assert "—" not in d and "–" not in d  # no long/short dash in strings
+    assert bot_commands("ru") is not bot_commands("ru")  # fresh list per call
+
+
+# ════ F6: video quality for link videos ════
+
+def _video_cb_update(data):
+    """A callback update for the video flow: cq with a workable status mock
+    (vstat.edit_text/delete must be awaitable on the reply_text result)."""
+    cq = MagicMock()
+    cq.data = data
+    cq.answer = AsyncMock()
+    cq.edit_message_text = AsyncMock()
+    cq.edit_message_reply_markup = AsyncMock()
+    vstat = MagicMock()
+    vstat.edit_text = AsyncMock()
+    vstat.delete = AsyncMock()
+    cq.message.reply_text = AsyncMock(return_value=vstat)
+    update = MagicMock()
+    update.callback_query = cq
+    update.effective_user = User(id=123, is_bot=False, first_name="Test")
+    update.effective_chat.id = 456
+    return update
+
+
+def _video_context(fake_config, media):
+    context = MagicMock()
+    context.bot_data = {"cfg": fake_config, "media": media}
+    context.chat_data = {}
+    context.bot.send_video = AsyncMock()
+    return context
+
+
+def _run_created_tasks(context):
+    """context.application.create_task replacer: run the background video task
+    for real (a MagicMock would swallow the coroutine)."""
+    tasks = []
+
+    def _capture(coro, update=None):
+        t = asyncio.create_task(coro)
+        tasks.append(t)
+        return t
+
+    context.application.create_task = _capture
+    return tasks
+
+
+def test_video_quality_picker_full_ladder():
+    """The picker offers the full ladder 240-1440, two buttons per row,
+    ascending (the old picker's layout, extended with 240/360), and keeps the
+    old dl:q:{q}:{vid} callback contract."""
+    from bot.handler import _video_quality_picker
+    kb = _video_quality_picker("abc12345678")
+    rows = [[b.text for b in row] for row in kb.inline_keyboard]
+    assert rows == [["240p", "360p"], ["480p", "720p"], ["1080p", "1440p"]]
+    cbs = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert cbs == [f"dl:q:{q}:abc12345678"
+                   for q in ("240", "360", "480", "720", "1080", "1440")]
+
+
+@pytest.mark.asyncio
+async def test_video_button_shows_quality_picker(app, fake_config):
+    """dl:vid (the Video button on a link card) shows the quality picker —
+    the owner's original flow: NO download starts until a height is picked."""
+    vid = "abc12345678"
+    media = MagicMock()
+    media.download_video = AsyncMock()
+
+    update = _video_cb_update(f"dl:vid:{vid}")
+    context = _video_context(fake_config, media)
+    context.chat_data[f"url:{vid}"] = {
+        "url": f"https://www.youtube.com/watch?v={vid}", "title": "Test Video"}
+
+    with patch("bot.handler.get_user_lang", AsyncMock(return_value="ru")):
+        await handle_callback(update, context)
+
+    cq = update.callback_query
+    cq.edit_message_text.assert_awaited_once()
+    text, kwargs = cq.edit_message_text.await_args.args[0], cq.edit_message_text.await_args.kwargs
+    assert "Выбери качество:" in text and "Test Video" in text
+    kb = kwargs["reply_markup"]
+    rows = [[b.text for b in row] for row in kb.inline_keyboard]
+    assert rows == [["240p", "360p"], ["480p", "720p"], ["1080p", "1440p"]]
+    cbs = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert cbs == [f"dl:q:{q}:{vid}" for q in ("240", "360", "480", "720", "1080", "1440")]
+    media.download_video.assert_not_awaited()  # no silent default download
+    context.bot.send_video.assert_not_called()
+    assert context.chat_data.get("video_busy") is None
+
+
+@pytest.mark.asyncio
+async def test_quality_pick_downloads_at_picked_height(app, fake_config, tmp_path):
+    """A picker selection (dl:q:240) downloads at exactly that height, the
+    caption carries the chosen label; the delivered file carries NO keyboard
+    (owner 06.11: no post-delivery quality offers)."""
+    vid = "abc12345678"
+    url = f"https://www.youtube.com/watch?v={vid}"
+    media = MagicMock()
+    mp4 = tmp_path / "v.mp4"
+    mp4.write_bytes(b"v")
+    media.download_video = AsyncMock(return_value=(
+        str(mp4), {"id": vid, "chosen_quality": "240", "channel": "Ch",
+                   "upload_date": "20240101"}))
+
+    update = _video_cb_update(f"dl:q:240:{vid}")
+    context = _video_context(fake_config, media)
+    context.chat_data[f"url:{vid}"] = {"url": url, "title": "Test Video"}
+    tasks = _run_created_tasks(context)
+
+    with patch("bot.handler.get_user_lang", AsyncMock(return_value="ru")), \
+         patch("bot.handler.insert_query", AsyncMock(return_value=7)), \
+         patch("bot.handler.insert_event", AsyncMock()), \
+         patch("bot.handler.incr_usage", AsyncMock()):
+        await handle_callback(update, context)
+        await asyncio.gather(*tasks)
+
+    media.download_video.assert_awaited_once()
+    assert media.download_video.await_args.args[0] == url
+    assert media.download_video.await_args.args[1] == "240"  # the picked height
+    assert "240p" in update.callback_query.edit_message_text.await_args.args[0]
+    caption = context.bot.send_video.await_args.kwargs["caption"]
+    assert "240p" in caption
+    # no post-delivery quality offers: the sent video has no keyboard at all
+    assert context.bot.send_video.await_args.kwargs.get("reply_markup") is None
+    assert context.chat_data.get("video_busy") is None  # released in finally
+
+
+@pytest.mark.asyncio
+async def test_dlv_button_shows_full_picker(app, fake_config):
+    """The dlv button (Video on a delivered track) opens the same full-ladder
+    picker: 240-1440, dl:q callbacks, no download until a pick."""
+    from services.llm_search import Candidate
+    vid = "abc12345678"
+    track = Candidate(vid, "Track Title", "Artist", 200, 1000)
+    track.source = "youtube"
+    media = MagicMock()
+    media.download_video = AsyncMock()
+
+    update = _video_cb_update(f"dlv:5:0")
+    context = _video_context(fake_config, media)
+    with patch("bot.handler._load_state",
+               AsyncMock(return_value={"candidates": [track]})), \
+         patch("bot.handler.get_user_lang", AsyncMock(return_value="ru")):
+        await handle_callback(update, context)
+
+    cq = update.callback_query
+    cq.message.reply_text.assert_awaited_once()
+    text, kwargs = cq.message.reply_text.await_args.args[0], cq.message.reply_text.await_args.kwargs
+    assert "Выбери качество:" in text and "Track Title" in text
+    cbs = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert cbs == [f"dl:q:{q}:{vid}" for q in ("240", "360", "480", "720", "1080", "1440")]
+    media.download_video.assert_not_awaited()
+    # the picker stores the url state the dl:q callback resolves
+    assert context.chat_data[f"url:{vid}"]["url"] == f"https://www.youtube.com/watch?v={vid}"
+
+
+@pytest.mark.asyncio
+async def test_qvid_callback_is_gone_no_download(app, fake_config):
+    """Owner 06.11: the post-delivery quality re-fetch buttons (qvid:{vid}:{q})
+    are removed with their handler. A qvid press — even a well-formed one on a
+    message delivered before the change — downloads nothing and sends nothing;
+    the callback just falls through (answered by the generic q.answer())."""
+    media = MagicMock()
+    media.download_video = AsyncMock()
+
+    for payload in ("qvid:abc12345678:240",     # well-formed (old live button)
+                    "qvid:abc12345678:999"):    # garbage quality
+        update = _video_cb_update(payload)
+        context = _video_context(fake_config, media)
+        await handle_callback(update, context)
+        media.download_video.assert_not_awaited()
+        context.bot.send_video.assert_not_awaited()
+        update.callback_query.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_audio_link_has_no_quality_buttons(app, recording, tmp_path):
+    """The quality row is video-only: an audio send (dl:aud path via
+    _send_track) never carries qvid buttons."""
+    from bot.handler import _send_track
+    from services.llm_search import Candidate
+    from services.metadata import MetaOut
+
+    m4a = tmp_path / "v1.m4a"
+    m4a.write_bytes(b"fake")
+    track = Candidate("v1", "Test Track", "Test Artist", 200, 1000, url="https://a.example/v1")
+
+    media = MagicMock()
+    media.download_audio = AsyncMock(return_value=(
+        str(m4a), None, {"id": "v1", "title": "Test Track", "uploader": "Test Artist"}))
+    meta = MagicMock()
+    meta.resolve = AsyncMock(return_value=MetaOut(artist="Test Artist", track="Test Track"))
+
+    context = MagicMock()
+    context.bot_data = {"metadata": meta}
+    context.bot.send_audio = AsyncMock()
+    context.chat_data = {}
+
+    update = _text_update("test")
+    update.set_bot(app.bot)
+    update.message.set_bot(app.bot)
+    update.effective_chat.set_bot(app.bot)
+
+    with _patch_store(), patch("bot.handler.tag_enrichment.enrich"), \
+         patch("bot.handler.upsert_session", AsyncMock()):
+        ok = await _send_track(update, context, None, media, 1, 0, [track], track,
+                               "high", keyboard="url")
+
+    assert ok is True
+    kb = context.bot.send_audio.await_args.kwargs["reply_markup"]
+    callbacks = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert callbacks  # the url keyboard (Similar/Fact) is there...
+    assert not any(c.startswith("qvid:") for c in callbacks)  # ...without any quality buttons
+
+
+# ════ Miss chain: same-RECORD skip (live 06.11, Iron Man 2) ════
+
+class TestNextFreshIndex:
+    """The rejected song must not return from another upload, even when the
+    uploader's version tag changes the exact normalized key."""
+
+    @staticmethod
+    def _cand(vid, title):
+        from types import SimpleNamespace
+        return SimpleNamespace(video_id=vid, title=title)
+
+    def test_same_song_other_upload_skipped(self):
+        from bot.handler import _next_fresh_index
+        cands = [
+            self._cand("v0", "AC/DC - Shoot To Thrill (Iron Man 2 Version)"),
+            self._cand("v1", "AC/DC - Shoot to Thrill - Iron Man 2 Version [HD]"),
+            self._cand("v2", "John Debney - Sledgehammer"),
+        ]
+        # rank0 (v0) rejected -> v1 is the same record under another upload
+        assert _next_fresh_index(cands, 0, ["v0"]) == 2
+
+    def test_different_song_served(self):
+        from bot.handler import _next_fresh_index
+        cands = [
+            self._cand("v0", "Hilary Duff - Come Clean"),
+            self._cand("v1", "Hilary Duff - Fly"),
+        ]
+        assert _next_fresh_index(cands, 0, ["v0"]) == 1
+
+    def test_exhausted_returns_end(self):
+        from bot.handler import _next_fresh_index
+        cands = [
+            self._cand("v0", "AC/DC - Shoot To Thrill (Iron Man 2 Version)"),
+            self._cand("v1", "Shoot to Thrill - AC/DC"),
+        ]
+        assert _next_fresh_index(cands, 0, ["v0"]) == len(cands)
+
+
+# ════ network-storm watchdog (incidents 08-10.11: silent fetcher death) ════
+
+def test_storm_restart_decision():
+    """Heavy recent storm + network back -> restart. Quiet net, stale storm
+    or dead network -> keep running (weather, not a dead fetcher)."""
+    from bot.main import _storm_restart_needed
+    now = 1_000_000.0
+    storm = {"count": 20, "last_ts": now - 60}
+    assert _storm_restart_needed(storm, True, now=now)      # storm + net back
+    assert not _storm_restart_needed(storm, False, now=now)  # net still down
+    assert not _storm_restart_needed({"count": 20, "last_ts": now - 10_000},
+                                     True, now=now)          # storm long gone
+    assert not _storm_restart_needed({"count": 3, "last_ts": now - 60},
+                                     True, now=now)          # light weather
+    assert not _storm_restart_needed({"count": 0, "last_ts": 0}, True, now=now)
+
+
+# ════ duplicate-update guard (10.11: one message, two searches) ════
+
+def test_duplicate_update_guard():
+    """The same text from the same chat inside the window is dropped; a
+    different text, a different chat, or the same text after the window
+    passes."""
+    from bot import handler as h
+    h._recent_descs.clear()
+    assert not h._drop_duplicate(1, "дип перпл")          # first -> pass
+    assert h._drop_duplicate(1, "дип перпл")              # redelivery -> drop
+    assert not h._drop_duplicate(2, "дип перпл")          # another chat
+    assert not h._drop_duplicate(1, "дип перпл кинг оф дримс")  # another text
+    # after the window the deliberate repeat works again
+    h._recent_descs[(1, hash("дип перпл"))] = h.time.monotonic() - 30.0
+    assert not h._drop_duplicate(1, "дип перпл")
+
+
+# ════ verdict advice sanitizer (11.11 live: ID3 advice in the card) ════
+
+def test_sanitize_verdict_strips_advice_keeps_facts():
+    from bot.handler import _sanitize_verdict
+    live = ("Музыку к фильму «Бойцовский клуб» (1999) написали The Dust Brothers. "
+            "Пожалуйста, укажите правильное имя исполнителя в ID3-тегах вашего файла.")
+    assert _sanitize_verdict(live) == \
+        "Музыку к фильму «Бойцовский клуб» (1999) написали The Dust Brothers."
+    clean = "Mystère et suspense — сингл Fonky Family, 1998, дебютный альбом."
+    assert _sanitize_verdict(clean) == clean
+    assert _sanitize_verdict("") == ""

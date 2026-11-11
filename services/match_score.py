@@ -15,13 +15,21 @@ strong artist+title match for this_track):
   fidelity      0..0.10  duration within the typical range for the track
   views         0..0.05  popularity (weak signal, views can be inflated)
   noise        -0.20     remix/cover/live/tribute (is_noise from the filter)
+  ref-disq     score=0   candidate channel == the reference artist (similar):
+                         the deterministic double-check of the rank-tail
+                         reference ban — a banned candidate must neither
+                         auto-download nor pose as a near-equal runner-up
+                         in the ambiguity gap check, no matter how the LLM
+                         scored it
 
 For similar/from_source (target is None) there is no comparison object:
 base = LLM rank score * 0.7 (relevance is the LLM's call, discounted for
-overconfidence) plus the same quality features. Thresholds: >= AUTO_THRESHOLD
-triggers auto-download, otherwise a top-3 preview. The initial thresholds are
-meant to be retuned from production hit/miss feedback once match_score labels
-accumulate.
+overconfidence) plus the same quality features. There is deliberately NO
+genre term: sharing signals.genre with the reference earns nothing — only
+the empirical getSimilar-neighbor boost in the rank tail moves similar
+scores. Thresholds: >= AUTO_THRESHOLD triggers auto-download, otherwise a
+top-3 preview. The initial thresholds are meant to be retuned from
+production hit/miss feedback once match_score labels accumulate.
 """
 import re
 from dataclasses import dataclass, field
@@ -197,9 +205,24 @@ def _views_score(views: int) -> tuple[float, str]:
     return 0.0, ""
 
 
-def score_candidate(c, target: dict, intent: str, llm_score: float) -> Scored:
+def _channel_is_reference(channel: str, ref_key: str) -> bool:
+    """True when the candidate's channel (minus the '- Topic' YouTube Music
+    suffix) normalizes exactly to the reference artist key. Local mirror of
+    llm_search._channel_key + _ref_key semantics (_norm is the same
+    normalization) — kept here to avoid the circular import."""
+    ch = re.sub(r"\s*[-–—]\s*topic\s*$", "", channel or "", flags=re.I)
+    return bool(ref_key) and _norm(ch) == ref_key
+
+
+def score_candidate(c, target: dict, intent: str, llm_score: float,
+                    ref_key: str = "") -> Scored:
     """Score a candidate. target={artist,track} for this_track, else {}.
-    c is a Candidate object (title/channel/duration/views/is_noise). llm_score is the LLM#2 rank-score."""
+    c is a Candidate object (title/channel/duration/views/is_noise). llm_score is the LLM#2 rank-score.
+    ref_key (optional, similar rank mode): _ref_key-normalized reference
+    artist. A candidate whose channel IS that artist is disqualified —
+    match_score 0.0 — the deterministic double-check of the rank-tail
+    reference ban (auto-download and the ambiguity gap read match_score,
+    so a banned-but-LLM-loved reference must not win there either)."""
     reasons = []
     tgt_artist = (target or {}).get("artist")
     tgt_track = (target or {}).get("track")
@@ -267,5 +290,12 @@ def score_candidate(c, target: dict, intent: str, llm_score: float) -> Scored:
     if getattr(c, "is_noise", False):
         base -= 0.20
         reasons.append("noise -0.20")
+
+    # Same-artist-as-reference disqualification (double-check of the rank-tail
+    # ban): the reference itself is never a valid similar answer, whatever the
+    # LLM score or the quality features above say.
+    if _channel_is_reference(getattr(c, "channel", ""), ref_key):
+        reasons.append("reference-artist disqualified")
+        return Scored(0.0, reasons)
 
     return Scored(max(0.0, min(1.0, base)), reasons)

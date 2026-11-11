@@ -110,14 +110,16 @@ async def test_similar_search(bothub_client):
 
 @pytest.mark.asyncio
 async def test_this_track_exact(bothub_client):
-    """this_track: a target with artist+track -> match_score with a bonus."""
+    """this_track: a target with artist+track -> match_score with a bonus.
+    Stage 1: the confident-match shortcut fires on an exact fuzzy match —
+    LLM#2 rank is NOT called (chat_json once)."""
     with patch.object(bothub_client, "chat_json") as mock_chat:
         mock_chat.side_effect = [
             _extract_json(
                 intent="this_track",
                 target={"artist": "Michael Jackson", "track": "Billie Jean"},
             ),
-            _rank_json(best_index=0),
+            _rank_json(best_index=0),  # queued on purpose: must stay unused
         ]
 
         with patch("services.llm_search.search_metadata") as mock_yt:
@@ -127,6 +129,8 @@ async def test_this_track_exact(bothub_client):
             ]
             out = await search_candidates("Michael Jackson Billie Jean", bothub_client)
 
+    assert mock_chat.await_count == 1, "an exact match takes the fuzzy shortcut, no LLM#2"
+    assert out.confidence == "high"
     assert out.intent == "this_track"
     assert out.candidates[0].match_score >= 0.65
 
@@ -245,7 +249,59 @@ async def test_similar_boost_getsimilar(bothub_client):
 
     # v2 — a sonic neighbor of the reference — raised above v1 (the genre neighbor) despite the lower LLM score
     assert out.candidates[out.best_index].video_id == "v2"
-    assert out.candidates[0].score == pytest.approx(0.90)
+    # the neighbor bonus is +0.20 (doctrine s3: was a decorative +0.10 that
+    # never overtook the genre answer): 0.80 + 0.20
+    assert out.candidates[0].score == pytest.approx(1.00)
+    # the genre-only mate (same era/genre, NOT a getSimilar neighbor) gets
+    # no bonus anywhere: its LLM score stands unchanged
+    assert out.candidates[1].score == pytest.approx(0.85)
+
+
+@pytest.mark.asyncio
+async def test_reference_artist_match_score_disqualified(bothub_client):
+    """Same-artist-as-reference double-check (doctrine s3): the reference
+    candidate is banned to the tail by the rank filter AND its calibrated
+    match_score is 0.0 — a banned-but-LLM-loved reference must neither
+    auto-download nor pose as a near-equal runner-up in the ambiguity gap."""
+    class _MetaSvc:
+        _lastfm_key = ""
+        async def similar_artists(self, artist, limit=10):
+            return ["Barclay James Harvest"]
+
+    rank = {
+        "ranked": [
+            {"video_id": "v1", "score": 0.95, "rationale": "Сам референс."},
+            {"video_id": "v2", "score": 0.70, "rationale": "Sonic-сосед."},
+        ],
+        "best_index": 0,
+        "confidence": "high",
+        "verdict": "Держи.",
+        "need_clarify": False,
+        "clarify_question": "",
+    }
+    with patch.object(bothub_client, "chat_json") as mock_chat:
+        mock_chat.side_effect = [
+            _extract_json(intent="similar", reference={"artist": "The Moody Blues", "track": None}),
+            rank,
+        ]
+        with patch("services.llm_search.search_metadata") as mock_yt:
+            mock_yt.return_value = [
+                {"video_id": "v1", "title": "Nights in White Satin",
+                 "channel": "The Moody Blues - Topic", "duration": 280, "views": 900000},
+                {"video_id": "v2", "title": "Poor Man's Moody Blues",
+                 "channel": "Barclay James Harvest - Topic", "duration": 240, "views": 50000},
+            ]
+            out = await search_candidates(
+                "похожее на Nights in White Satin", bothub_client, metadata_svc=_MetaSvc())
+
+    by_id = {c.video_id: c for c in out.candidates}
+    # 0.95 LLM + topic + fidelity + views would clear AUTO_SIMILAR (0.85):
+    # the disqualification must zero it anyway
+    assert by_id["v1"].match_score == 0.0
+    assert "reference-artist disqualified" in by_id["v1"].match_reasons
+    # a non-reference candidate keeps its calibrated score (no leak of the
+    # reference penalty onto neighbors)
+    assert by_id["v2"].match_score > 0.0
 
 
 @pytest.mark.asyncio
@@ -418,6 +474,38 @@ def test_format_for_rank_no_sonic_when_absent():
     """Without the sonic field the sound-description line is not printed."""
     out = _format_for_rank("похожее на Queen", {"genre": "rock"}, [])
     assert "sonic" not in out
+
+
+def test_format_for_rank_neighbor_marker():
+    """[neighbor?] is prepended to the title of a candidate whose channel IS
+    a getSimilar neighbor of the reference ('- Topic' stripped); a genre-mate
+    and the reference itself carry no marker. Deterministic data, not an LLM
+    guess (doctrine s3)."""
+    cands = [
+        {"video_id": "v1", "title": "Poor Man's Moody Blues",
+         "channel": "Barclay James Harvest - Topic", "duration": 240, "views": 50000},
+        {"video_id": "v2", "title": "A Whiter Shade of Pale",
+         "channel": "Procol Harum - Topic", "duration": 240, "views": 900000},
+        {"video_id": "v3", "title": "Nights in White Satin",
+         "channel": "The Moody Blues - Topic", "duration": 280, "views": 900000},
+    ]
+    out = _format_for_rank("песня как Nights in White Satin", {"genre": "rock"}, cands,
+                           neighbors=["Barclay James Harvest", "The Strawbs"])
+    v1_line = next(l for l in out.splitlines() if "video_id=v1" in l)
+    v2_line = next(l for l in out.splitlines() if "video_id=v2" in l)
+    v3_line = next(l for l in out.splitlines() if "video_id=v3" in l)
+    assert "| [neighbor?] Poor Man's Moody Blues |" in v1_line
+    assert "[neighbor?]" not in v2_line
+    assert "[neighbor?]" not in v3_line
+
+
+def test_format_for_rank_no_neighbor_marker_without_neighbors():
+    """No neighbors passed (non-similar ranks, refinement rerank) -> no
+    marker anywhere, even for channels that would match."""
+    cands = [{"video_id": "v1", "title": "Song", "channel": "Barclay James Harvest",
+              "duration": 240, "views": 50000}]
+    out = _format_for_rank("песня как Nights in White Satin", {"genre": "rock"}, cands)
+    assert "[neighbor?]" not in out
 
 
 def test_is_non_music():
@@ -886,6 +974,258 @@ async def test_resolve_reference_sonar_fallback(bothub_client):
     assert out.queries[:1] == ["Neighbor Band"]  # the sonar artist's neighbors in queries
 
 
+# ════ B1 (research П4): sonar rescue of a low-confidence channel; parallel lastfm/ytdlp probe ════
+
+def _b1_yt_entries():
+    """The live П4 shape: the only title-matching upload sits on an aggregator
+    channel that carries NEITHER significant token of the reference artist."""
+    return [{"video_id": "r1", "title": "Dior wild man (Full Official Track)",
+             "channel": "BluesMen Channel - Blues Collection",
+             "duration": 91, "views": 50000}]
+
+
+class _MetaSvcB1:
+    """Resolve-level metadata stub: track_search answers with `matches`,
+    getSimilar knows only the canonical artist's neighbors, every call is
+    recorded. track_delay adds latency to the Last.fm query (parallelism
+    assertions)."""
+    _lastfm_key = "k"
+
+    def __init__(self, matches=None, canonical="Ry Cooder",
+                 neighbors=None, track_delay=0.0):
+        self._matches = matches if matches is not None else []
+        self._canonical = canonical
+        self._neighbors = neighbors if neighbors is not None else [
+            "David Lindley", "Lowell George", "Peter Case"]
+        self._delay = track_delay
+        self.calls = []
+
+    async def track_search(self, track, limit=8):
+        import asyncio as _aio
+        if self._delay:
+            await _aio.sleep(self._delay)
+        self.calls.append(("track_search", track))
+        return self._matches
+
+    async def similar_artists(self, artist, limit=10):
+        self.calls.append(("getSimilar", artist))
+        return self._neighbors if artist == self._canonical else []
+
+
+@pytest.mark.asyncio
+async def test_resolve_sonar_rescues_low_confidence_channel(bothub_client, caplog):
+    """П4 (the live «Ry Cooder - Dior wild man» case): Last.fm misses the
+    fan-upload title AND the only yt-dlp channel is an aggregator the
+    credibility filter rejected -> ONE sonar question rescues the real artist
+    (source="sonar"), its neighbors are fetched, and the low-confidence
+    warning stays silent."""
+    import logging
+    from services.llm_search import _resolve_reference
+    bothub_client._sonar_model = "sonar"
+    svc = _MetaSvcB1(matches=[], canonical="Ry Cooder")
+    captured = {}
+
+    with patch("services.llm_search.search_metadata") as mock_yt:
+        async def yt(queries, per_query=20, on_progress=None):
+            return _b1_yt_entries()
+        mock_yt.side_effect = yt
+        with patch("services.llm_search._sonar_ground") as sg:
+            async def sg_hit(b, question, trace=None):
+                captured["question"] = question
+                return {"artist": "Ry Cooder", "track": "Dior wild man", "sure": True}
+            sg.side_effect = sg_hit
+            with caplog.at_level(logging.INFO, logger="bot.llm_search"):
+                out = await _resolve_reference(
+                    {"artist": "Ry Cooder", "track": "Dior wild man"},
+                    svc, bothub=bothub_client)
+
+    assert out["source"] == "sonar" and out["artist"] == "Ry Cooder"
+    # neighbors fetched for the SONAR artist (not the aggregator channel)
+    assert ("getSimilar", "Ry Cooder") in svc.calls
+    assert out["neighbors"] == ["David Lindley", "Lowell George", "Peter Case"]
+    # the rescue question names the user's pair; the rescue is logged
+    assert "похожее на трек: Ry Cooder - Dior wild man" in captured["question"]
+    assert "sonar rescued" in caplog.text
+    assert "channel fallback kept low-confidence" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_sonar_miss_rejects_aggregator_channel(bothub_client, caplog):
+    """Sonar misses ({}): the aggregator channel («BluesMen Channel - Blues
+    Collection», QA s1 06.11) is NOT canonized — the reference artist stays,
+    so getSimilar runs on the real artist, and the rejection is logged."""
+    import logging
+    from services.llm_search import _resolve_reference
+    bothub_client._sonar_model = "sonar"
+    svc = _MetaSvcB1(matches=[], canonical="Ry Cooder")
+
+    with patch("services.llm_search.search_metadata") as mock_yt:
+        async def yt(queries, per_query=20, on_progress=None):
+            return _b1_yt_entries()
+        mock_yt.side_effect = yt
+        with patch("services.llm_search._sonar_ground") as sg:
+            async def sg_miss(b, question, trace=None):
+                return {}
+            sg.side_effect = sg_miss
+            with caplog.at_level(logging.INFO, logger="bot.llm_search"):
+                out = await _resolve_reference(
+                    {"artist": "Ry Cooder", "track": "Dior wild man"},
+                    svc, bothub=bothub_client)
+
+    assert out["source"] == "llm"
+    assert out["artist"] == "Ry Cooder"
+    assert ("getSimilar", "Ry Cooder") in svc.calls
+    assert "aggregator channel" in caplog.text
+    assert "sonar rescued" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_lastfm_hit_never_calls_sonar(bothub_client):
+    """A Last.fm hit resolves the artist: neither the rescue nor the fallback
+    sonar question may fire — sonar costs $0.008 per call."""
+    from services.llm_search import _resolve_reference
+    bothub_client._sonar_model = "sonar"
+    svc = _MetaSvcB1(matches=[{"artist": "Ry Cooder", "listeners": 90000}],
+                     canonical="Ry Cooder")
+    called = {}
+
+    with patch("services.llm_search.search_metadata") as mock_yt:
+        async def yt(queries, per_query=20, on_progress=None):
+            called["yt"] = True
+            return _b1_yt_entries()
+        mock_yt.side_effect = yt
+        with patch("services.llm_search._sonar_ground") as sg:
+            async def sg_spy(b, question, trace=None):
+                called["sonar"] = True
+                return {"artist": "Wrong", "sure": True}
+            sg.side_effect = sg_spy
+            out = await _resolve_reference(
+                {"artist": "Ry Cooder", "track": "Dior wild man"},
+                svc, bothub=bothub_client)
+
+    assert out["source"] == "lastfm-track-search" and out["artist"] == "Ry Cooder"
+    assert "sonar" not in called           # sonar never called on a Last.fm hit
+
+
+@pytest.mark.asyncio
+async def test_resolve_sonar_disabled_old_low_confidence_path(bothub_client, caplog):
+    """The layer is off (empty sonar model): the gate inside _sonar_ground
+    answers {} without a single LLM call, and the aggregator channel is
+    rejected — the reference artist survives as the canonical one."""
+    import logging
+    from services.llm_search import _resolve_reference
+    # bothub_client fixture default: sonar_model "" -> sonar_enabled False
+    svc = _MetaSvcB1(matches=[], canonical="Ry Cooder")
+    gens = []
+
+    async def chat_spy(system, user, max_tokens=None, trace=None,
+                       gen_name="llm", model=None):
+        gens.append(gen_name)
+        return None
+
+    with patch.object(bothub_client, "chat_json", side_effect=chat_spy):
+        with patch("services.llm_search.search_metadata") as mock_yt:
+            async def yt(queries, per_query=20, on_progress=None):
+                return _b1_yt_entries()
+            mock_yt.side_effect = yt
+            with caplog.at_level(logging.INFO, logger="bot.llm_search"):
+                out = await _resolve_reference(
+                    {"artist": "Ry Cooder", "track": "Dior wild man"},
+                    svc, bothub=bothub_client)
+
+    assert out["source"] == "llm"
+    assert out["artist"] == "Ry Cooder"
+    assert gens == []                      # the gate: no sonar-ground generation at all
+    assert "aggregator channel" in caplog.text
+
+
+# ════ B1 latency: the lastfm query and the ytdlp probe run concurrently ════
+
+@pytest.mark.asyncio
+async def test_resolve_parallel_probe_lastfm_hit_wins_no_serial_wait(bothub_client):
+    """Last.fm hits while the (slower) yt-dlp probe is still running: Last.fm
+    wins, the probe is dropped, and the resolve does NOT wait for the probe
+    serially after the Last.fm answer (old serial cost: lastfm + probe)."""
+    import asyncio as aio
+    import time
+    from services.llm_search import _resolve_reference
+    svc = _MetaSvcB1(matches=[{"artist": "Bobby Vee", "listeners": 400000}],
+                     canonical="Bobby Vee", track_delay=0.05)
+    probe_done = {}
+
+    with patch("services.llm_search.search_metadata") as mock_yt:
+        async def slow_probe(queries, per_query=20, on_progress=None):
+            await aio.sleep(0.5)   # the probe is far slower than the lastfm hit
+            probe_done["yes"] = True
+            return [{"video_id": "r1", "title": "The Night Has a Thousand Eyes",
+                     "channel": "Wrong Band - Topic", "duration": 200, "views": 10}]
+        mock_yt.side_effect = slow_probe
+        t0 = time.perf_counter()
+        out = await _resolve_reference(
+            {"artist": "Bobby Vee", "track": "The Night Has a Thousand Eyes"},
+            svc, bothub=None)
+        elapsed = time.perf_counter() - t0
+
+    assert out["source"] == "lastfm-track-search" and out["artist"] == "Bobby Vee"
+    assert elapsed < 0.4, \
+        "a Last.fm hit must not wait for the yt-dlp probe (serial would be >= 0.55s)"
+
+
+@pytest.mark.asyncio
+async def test_resolve_parallel_probe_used_on_lastfm_miss(bothub_client):
+    """Last.fm misses: the already-running probe's CREDIBLE channel (its name
+    carries the reference artist) becomes the canonical artist — no sonar, no
+    low-confidence warning. The resolve waits only max(lastfm, probe), not
+    their sum."""
+    import asyncio as aio
+    import time
+    from services.llm_search import _resolve_reference
+    svc = _MetaSvcB1(matches=[], canonical="Ry Cooder", track_delay=0.3)
+
+    with patch("services.llm_search.search_metadata") as mock_yt:
+        async def probe(queries, per_query=20, on_progress=None):
+            assert per_query == 3            # the resolve's channel probe
+            assert queries == ["Ry Cooder Dior wild man"]  # space-joined phrase
+            await aio.sleep(0.3)
+            return [{"video_id": "r1", "title": "Dior wild man",
+                     "channel": "Ry Cooder - Topic", "duration": 120, "views": 9000}]
+        mock_yt.side_effect = probe
+        t0 = time.perf_counter()
+        out = await _resolve_reference(
+            {"artist": "Ry Cooder", "track": "Dior wild man"},
+            svc, bothub=None)
+        elapsed = time.perf_counter() - t0
+
+    assert out["source"] == "ytdlp-channel" and out["artist"] == "Ry Cooder"
+    assert ("getSimilar", "Ry Cooder") in svc.calls
+    # concurrency: lastfm 0.3s and probe 0.3s overlap — serial would be >= 0.6s
+    assert elapsed < 0.5, "the probe must overlap the Last.fm query, not queue after it"
+
+
+@pytest.mark.asyncio
+async def test_resolve_parallel_both_miss_keeps_llm_path(bothub_client, caplog):
+    """Both miss (no Last.fm match, empty probe): the pre-B1 degraded path —
+    the reference stays as-is (source "llm"), neighbors are still fetched for
+    it, and the resolver reports the empty neighborhood."""
+    import logging
+    from services.llm_search import _resolve_reference
+    svc = _MetaSvcB1(matches=[], canonical="Ry Cooder",
+                     neighbors=["David Lindley", "Lowell George"])
+
+    with patch("services.llm_search.search_metadata") as mock_yt:
+        async def empty(queries, per_query=20, on_progress=None):
+            return []
+        mock_yt.side_effect = empty
+        with caplog.at_level(logging.INFO, logger="bot.llm_search"):
+            out = await _resolve_reference(
+                {"artist": "Ry Cooder", "track": "Dior wild man"},
+                svc, bothub=None)
+
+    assert out["source"] == "llm" and out["artist"] == "Ry Cooder"
+    assert out["neighbors"] == ["David Lindley", "Lowell George"]
+    assert ("getSimilar", "Ry Cooder") in svc.calls
+
+
 @pytest.mark.asyncio
 async def test_rerank_pool_reuse_and_fallback():
     """Pool re-ranking: scores are mapped, the reference is banned, a too-small pool -> None."""
@@ -1028,7 +1368,7 @@ async def test_referential_query_gets_context(bothub_client):
 
 
 @pytest.mark.asyncio
-async def test_rank_video_id_transposition_recovered(bothub_client):
+async def test_rank_video_id_transposition_recovered(bothub_client, monkeypatch):
     """LLM#2 transposed characters in the best candidate's video_id. Fuzzy matching
     recovers the model's pick, and a live version does not jump in place of the original."""
     from services.llm_search import _match_video_id, Candidate as C
@@ -1039,7 +1379,9 @@ async def test_rank_video_id_transposition_recovered(bothub_client):
     assert _match_video_id("zzzzzzzzzzz", cands) is None            # garbage
 
 
-    # end-to-end run: the ranker "slipped" on the best id, the system still picks it
+    # end-to-end run: the ranker "slipped" on the best id, the system still picks it.
+    # Stage 1: the confident fuzzy match on the original would skip LLM#2
+    # entirely, so pair_match is zeroed to keep exercising the RANK path.
     rank = {"ranked": [
                 {"video_id": "pAgnJDNJ4VA", "score": 1.0, "rationale": "студийная"},
                 {"video_id": "CFSxi96o43Q", "score": 0.4, "rationale": "концерт"}],
@@ -1051,6 +1393,9 @@ async def test_rank_video_id_transposition_recovered(bothub_client):
         if fake_chat.calls == 1:
             return _extract_json(intent="this_track", target={"artist": "AC/DC", "track": "Back in Black"})
         return rank
+
+    import services.fuzzy as fuzzy_mod
+    monkeypatch.setattr(fuzzy_mod, "pair_match", lambda *a: 0.0)
 
     with patch.object(bothub_client, "chat_json", side_effect=fake_chat):
         with patch("services.llm_search.search_metadata") as my:
@@ -1198,6 +1543,43 @@ class TestDestructiveModeration:
         # a Latin 'o' inside a Russian word does not escape the fold
         assert f("где купить нарк\u043eтики") == "drugs"
 
+    def test_regex_despaced_evasion(self):
+        from services.llm_search import destructive_prefilter as f
+        # multi-space evasion (security battery sec6): the de-spaced copies
+        # glue the words back together before the seamless pattern variants
+        assert f("к а к   и з г о т о в и т ь   н а р к о т и к и") == "drugs"
+        assert f("к а к  и з г о т о в и т ь  н а р к о т и к и") == "drugs"
+        assert f("как и з г о т о в и т ь наркотики") == "drugs"
+        # «музыка д л я у б и й с т в а» was passing BOTH layers before (the
+        # spaced violence pattern needs a contiguous «для»)
+        assert f("музыка д л я у б и й с т в а") == "violence"
+        assert f("музыка д л я   п ы т о к") == "violence"
+
+    def test_regex_greek_homoglyph(self):
+        from services.llm_search import destructive_prefilter as f
+        # Greek omicron inside «изготοвить» (security battery sec7): folds to
+        # Cyrillic in the cyr variant and hits the RU pattern
+        assert f("изг\u03bfтовить наркотики") == "drugs"
+        assert f("где купить нарк\u03bfтики") == "drugs"
+        # alpha folds the same way inside a Russian word
+        assert f("где дост\u03b1ть оружие") == "weapon"
+
+    def test_regex_despaced_false_positives_clean(self):
+        from services.llm_search import destructive_prefilter as f
+        # glue-tolerant «как» must not fire on words that merely contain it
+        legit = [
+            "какао",
+            "какао с молоком",
+            "как приготовить какао напиток",
+            # plain Cyrillic through the extended Greek fold tables: the new
+            # keys are Greek codepoints, Russian words pass byte-identical
+            "молоко и река у горы",
+            "греческая музыка для ужина",
+            "музыка для тренировок",
+        ]
+        for t in legit:
+            assert f(t) == "", t
+
     # --- layer 2: the LLM verdict ---
     @pytest.mark.asyncio
     async def test_llm_block_short_circuits(self, bothub_client):
@@ -1320,3 +1702,183 @@ async def test_resolve_prefers_channel_matching_reference(monkeypatch):
         {"artist": "Ry Cooder", "track": "Dior wild man"}, _Meta(), bothub=None)
     assert out["artist"] == "Ry Cooder"
     assert out["source"] == "ytdlp-channel"
+
+
+@pytest.mark.asyncio
+async def test_resolve_channel_filter_beats_compilation(monkeypatch, caplog):
+    """Acceptance s1 (Ry Cooder, third strike): a compilation channel that
+    merely hosts a matching title must NOT become the canonical artist when
+    any result's channel credibly carries the reference artist — even if the
+    compilation ranks first in raw order. Only artist-bearing channels
+    compete; no low-confidence warning fires."""
+    import logging
+    from services import llm_search as ls
+
+    class _Meta:
+        async def track_search(self, track, limit=8):
+            return []
+        async def similar_artists(self, artist, limit=10):
+            return ["Ry Cooder neighbor"]
+
+    async def fake_search_metadata(queries, per_query=3):
+        return [
+            # the prod shape: the compilation ranks first, title matches
+            {"channel": "BluesMen Channel - Blues Collection",
+             "title": "Ry Cooder - Dior wild man", "duration": 220, "views": 900000},
+            {"channel": "Ry Cooder - Topic",
+             "title": "Dior wild man", "duration": 200, "views": 400000},
+        ]
+
+    monkeypatch.setattr(ls, "search_metadata", fake_search_metadata)
+    with caplog.at_level(logging.WARNING, logger="bot.llm_search"):
+        out = await ls._resolve_reference(
+            {"artist": "Ry Cooder", "track": "Dior wild man"}, _Meta(), bothub=None)
+    assert out["artist"] == "Ry Cooder"
+    assert out["source"] == "ytdlp-channel"
+    assert "low-confidence" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_channel_fallback_rejects_aggregator_channel(monkeypatch, caplog):
+    """No channel carries the reference artist and every candidate channel is
+    an aggregator/brand (QA s1 06.11: «BluesMen Channel», «DIOR»): none is
+    canonized — the reference artist stays canonical and the rejection is
+    a visible warning line."""
+    import logging
+    from services import llm_search as ls
+
+    class _Meta:
+        async def track_search(self, track, limit=8):
+            return []
+        async def similar_artists(self, artist, limit=10):
+            return []
+
+    async def fake_search_metadata(queries, per_query=3):
+        return [
+            {"channel": "BluesMen Channel - Blues Collection",
+             "title": "Ry Cooder - Dior wild man", "duration": 220, "views": 900000},
+            {"channel": "DIOR", "title": "Dior wild man", "duration": 90, "views": 50000},
+        ]
+
+    monkeypatch.setattr(ls, "search_metadata", fake_search_metadata)
+    with caplog.at_level(logging.WARNING, logger="bot.llm_search"):
+        out = await ls._resolve_reference(
+            {"artist": "Ry Cooder", "track": "Dior wild man"}, _Meta(), bothub=None)
+    # the aggregator channel is rejected; the user's own artist survives
+    assert out["artist"] == "Ry Cooder"
+    assert out["source"] == "llm"
+    assert "aggregator channel" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_warns_when_similar_discovery_empty(caplog):
+    """A successful resolve followed by an empty getSimilar must log the
+    'similar discovery: no neighbors' line (the s1 silent no-op)."""
+    import logging
+    from services import llm_search as ls
+
+    class _Meta:
+        async def track_search(self, track, limit=8):
+            return [{"artist": "Bobby Vee", "listeners": 400000}]
+        async def similar_artists(self, artist, limit=10):
+            return []
+
+    with caplog.at_level(logging.WARNING, logger="bot.llm_search"):
+        out = await ls._resolve_reference(
+            {"artist": "Bobby Vee", "track": "The Night Has a Thousand Eyes"},
+            _Meta(), bothub=None)
+    assert out["artist"] == "Bobby Vee"
+    assert out["source"] == "lastfm-track-search"
+    assert "similar discovery: no neighbors for 'Bobby Vee' (source=lastfm-track-search)" in caplog.text
+
+
+# ════ live-test F2 (2026-11-05): title-level rejection + echo guard ════
+
+def test_title_keys_collapse_upload_variants():
+    """Unit: _title_keys is the channel-independent identity of the TRACK —
+    the same song titled differently across uploads collapses to a shared
+    key, while a different song by the same artist does not."""
+    from services.llm_search import _title_keys
+    # Topic-channel upload: remaster tail stripped, no "Artist - Track" split
+    assert _title_keys("A Whiter Shade of Pale (2007 Remaster)") == \
+        {"a whiter shade of pale"}
+    # bootleg-channel upload: "Artist - Track" layout -> full + track-part keys
+    assert _title_keys("PROCOL HARUM - A Whiter Shade of Pale") == \
+        {"procol harum a whiter shade of pale", "a whiter shade of pale"}
+    # the F2 hinge: the two uploads share a key
+    assert _title_keys("A Whiter Shade of Pale (2007 Remaster)") & \
+        _title_keys("PROCOL HARUM - A Whiter Shade of Pale")
+    # a different song by the same artist shares nothing
+    assert not _title_keys("PROCOL HARUM - A Salty Dog") & \
+        _title_keys("A Whiter Shade of Pale (2007 Remaster)")
+
+
+@pytest.mark.asyncio
+async def test_excluded_titles_drop_same_title_different_video(bothub_client, caplog):
+    """Live-test F2: after «Не то» on A Whiter Shade of Pale the restart kept
+    serving the same song from other channels — video_id and channel-key
+    excludes miss those uploads. excluded_titles drops every candidate whose
+    normalized TITLE matches a rejected title, whatever the channel."""
+    import logging
+    # bh alias: referencing the fixture parameter both in a `with` header and
+    # deeper in the nested body trips a CPython 3.15.0 codegen bug (the
+    # parameter compiles to LOAD_GLOBAL -> NameError). One name, one use site
+    # class — the bug does not trigger.
+    bh = bothub_client
+    entries = [
+        # same song, fresh video_id, artist channel NOT excluded: only the
+        # title key catches it
+        {"video_id": "v1", "title": "PROCOL HARUM - A Whiter Shade of Pale",
+         "channel": "MrLodurr", "duration": 240, "views": 900000},
+        # same song again, bare title on a bootleg channel
+        {"video_id": "v2", "title": "A Whiter Shade of Pale",
+         "channel": "Beat-Bootleg Channel", "duration": 240, "views": 800000},
+        # a different track: must survive
+        {"video_id": "v3", "title": "Nights in White Satin",
+         "channel": "The Moody Blues - Topic", "duration": 280, "views": 500000},
+    ]
+
+    async def spy_chat(system, user, max_tokens=None, trace=None,
+                       gen_name="llm", model=None):
+        if gen_name == "llm-extract":
+            return _extract_json(intent="similar")
+        return _rank_json(best_index=0)
+
+    with patch.object(bh, "chat_json", side_effect=spy_chat):
+        with patch("services.llm_search.search_metadata", return_value=entries):
+            with caplog.at_level(logging.INFO, logger="bot.llm_search"):
+                out = await search_candidates(
+                    "песня как night in white sating\nНе то: A Whiter Shade of Pale",
+                    bh,
+                    excluded_titles={"A Whiter Shade of Pale (2007 Remaster)"})
+
+    assert [c.video_id for c in out.candidates] == ["v3"], \
+        "same-title candidates from other channels/uploads must drop"
+    assert "title exclusion: dropped 2 same-title candidate(s)" in caplog.text
+
+
+def test_drop_echo_queries_guards_restart(caplog):
+    """Unit (F2): on a restart LLM#1 regenerates queries about the just
+    rejected song/artist — the guard drops them (title match, artist match,
+    artist named inside a longer query) and logs the drops. Without
+    excluded_titles it is a strict no-op, even with excluded_artists set."""
+    import logging
+    from services.llm_search import _drop_echo_queries
+    queries = ["Justin Hayward", "Procol Harum", "Jethro Tull",
+               "Procol Harum A Whiter Shade of Pale", "King Crimson Epitaph"]
+
+    with caplog.at_level(logging.INFO, logger="bot.llm_search"):
+        kept = _drop_echo_queries(
+            queries,
+            excluded_titles={"A Whiter Shade of Pale (2007 Remaster)"},
+            excluded_artists={"procol harum", "fly records"})
+
+    assert kept == ["Justin Hayward", "Jethro Tull", "King Crimson Epitaph"]
+    assert "echo guard: dropped 2 restart query(ies)" in caplog.text
+    assert "Procol Harum A Whiter Shade of Pale" in caplog.text
+
+    # gate: no excluded_titles -> today's behavior even with excluded artists
+    assert _drop_echo_queries(queries, excluded_titles=None,
+                              excluded_artists={"procol harum"}) == queries
+    # and with nothing excluded at all
+    assert _drop_echo_queries(queries, None, None) == queries

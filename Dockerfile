@@ -4,8 +4,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# deno: JS runtime для yt-dlp (n-challenge). Минимум 2.3.0 — младшие
-# помечаются unsupported и форматы молча деградируют до 403-клиентов
+# deno: JS runtime for yt-dlp (the n-challenge). Minimum 2.3.0 - older
+# versions are marked unsupported and formats silently degrade to 403 errors
+# for clients
 RUN curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/download/v2.9.5/deno-x86_64-unknown-linux-gnu.zip \
     && unzip -q /tmp/deno.zip -d /tmp/deno \
     && mv /tmp/deno/deno /usr/local/bin/deno \
