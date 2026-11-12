@@ -156,6 +156,17 @@ async def post_shutdown(app: Application) -> None:
     await bothub.aclose()
     metadata: MetadataService = app.bot_data["metadata"]
     await metadata.aclose()
+    # SQLite caches hold non-daemon aiosqlite worker threads: unclosed, the
+    # process HANGS after main() returns (15:06 incident: a silent fetcher
+    # death shut the app down gracefully, the zombie process kept the
+    # container "running" and the bot deaf until a manual restart). Closed
+    # here, the process exits and docker's restart policy revives the bot.
+    for _mod_name in ("services.meta_cache", "services.search_cache"):
+        try:
+            _mod = __import__(_mod_name, fromlist=["aclose"])
+            await _mod.aclose()
+        except Exception:
+            pass  # not initialized or already closed - nothing to do
     tracing.shutdown()  # flush trailing traces before the process dies
     log.info("shutdown done")
 

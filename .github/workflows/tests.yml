@@ -27,3 +27,22 @@ jobs:
           pip install -r requirements.txt -r requirements-dev.txt
       - name: Tests
         run: python -m pytest tests/ --tb=short --ignore=tests/smoke_runner.py -q
+
+      # Why nobody reacted to red CI (audit 2026-11-12): no notification on
+      # failure, and deploys never looked at the tests result. This step closes
+      # the first half; the deploy-side CI gate patch lives in
+      # docs/ci-audit-2026-11-12.md (deploy workflows are owned elsewhere).
+      - name: Telegram alert to owner on failure
+        # Public mirror (music-search-mate) has no MSM_DEV_BOT_TOKEN: skip there.
+        if: failure() && github.repository == 'vonavikon/music-search-bot'
+        env:
+          TG_TOKEN: ${{ secrets.MSM_DEV_BOT_TOKEN }}
+          # 124882477 is the owner's personal Telegram chat id, NOT a secret.
+          TG_CHAT_ID: "124882477"
+        run: |
+          set +x  # lines below expand the bot token: never echo them
+          TEXT="CI RED: ${GITHUB_REPOSITORY} run ${GITHUB_RUN_ID} on ${GITHUB_REF_NAME}: job ${GITHUB_JOB} - ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl -fsS --max-time 15 --retry 2 -o /dev/null \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"

@@ -44,6 +44,10 @@ class FakeClient:
     def __init__(self):
         self.traces = []
         self.scores = []
+        self.named_traces = []
+
+    def trace(self, **kw):
+        self.named_traces.append(kw)
 
     def start_observation(self, **kw):
         root = FakeRoot()

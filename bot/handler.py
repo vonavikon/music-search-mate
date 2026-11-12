@@ -46,11 +46,13 @@ from services.store import (
 from services import store as store_svc  # the module itself: passed into search_candidates (surprise history)
 from services.tracing import SearchTrace, score_feedback
 from services.metadata import MetaOut, pretty_title
+from services.artist_canon import canonize_artist
 from services.media import cleanup_temp, _DEFAULT_VIDEO_QUALITY
 from services import tag_enrichment
 from services.broadcast_texts import BROADCAST_TEXTS
 from services.pipelines.legacy import record_class
 from services import meta_cache as mc  # L2 persistent metadata cache; its calls never raise
+from services import search_cache  # exact-repeat search cache (П1); its calls never raise
 from services.name_clean import clean_channel_name, strip_bio_disambiguation
 
 log = logging.getLogger("bot.handler")
@@ -1254,11 +1256,45 @@ async def _do_search(update, context, status, desc, excluded_ids=None,
         await status.edit_text(reason)
         return None
 
+    # Exact-repeat cache (П1): a CLEAN first search whose normalized text was
+    # delivered before is replayed from services/search_cache — no LLM, no
+    # ytsearch. Only the context-free, exclusion-free shape may be served from
+    # cache: a refinement (excluded_ids/artists/titles, restart_streak) or a
+    # chat with live context (ctx_history) produced an answer shaped by state
+    # the next asker does not have — those always run the live pipeline.
+    # The replay guards (no-repeat for THIS user, live demotion) run on every
+    # hit inside search_cache; the rate-limit gate above has already counted.
+    if (search_cache.is_cacheable(desc, None) and not ctx_history
+            and not (excluded_ids or excluded_artists or excluded_titles)
+            and not restart_streak):
+        try:
+            _sc_lang = await _lang_of(update.effective_user.id)
+            _sc_key = search_cache.cache_key(desc, _sc_lang)
+            _sc_payload = await search_cache.get(_sc_key)
+            if _sc_payload is not None:
+                _sc_out = search_cache.from_payload(_sc_payload)
+                if _sc_out is not None:
+                    _sc_out = await search_cache.replay_guard(
+                        _sc_out, update.effective_user.id)
+                    prog["alive"] = False
+                    pulse.cancel()
+                    actions.cancel()
+                    # marker: _finish_search must not re-put a (per-user
+                    # guarded) replay into the shared cache
+                    _sc_out.from_search_cache = True
+                    _sc_out.latency_ms = int((time.monotonic() - _t_search0) * 1000)
+                    log.info("search cache hit: …%s (lang=%s, %dms)",
+                             _sc_key[-8:], _sc_lang, _sc_out.latency_ms)
+                    return _sc_out
+        except Exception:
+            log.warning("search cache replay failed", exc_info=True)
+
     # v1.10: one search = one Langfuse trace. trace_id = correlation_id (uuid4.hex),
     # the same value goes to insert_query — the "log <-> DB <-> trace" link. Without
     # keys SearchTrace is a no-op; the pipeline never notices.
     trace = SearchTrace(uuid4().hex, update.effective_user.id,
-                        update.effective_chat.id if update.effective_chat else None, desc)
+                        update.effective_chat.id if update.effective_chat else None, desc,
+                        name=(desc or "")[:60] or "search")
     try:
         out = await search_candidates(desc, bothub, context=ctx_history,
                                       excluded_ids=excluded_ids,
@@ -1474,6 +1510,20 @@ async def _finish_search(update, context, status, out, desc, user):
                 return  # the honest slow-mode text is already in the status
             if ok:
                 _trace_finish()
+                # Exact-repeat cache (П1): remember fresh successful answers —
+                # the next identical clean first search replays without
+                # LLM/ytsearch. Guarded replays (from_search_cache) are never
+                # re-put: the guard's per-user best shift must not bake into
+                # the shared entry. search_cache.put swallows its own errors.
+                if (search_cache.is_cacheable(desc, out.intent)
+                        and not getattr(out, "from_search_cache", False)):
+                    try:
+                        _sc_lang = await _lang_of(user.id)
+                        await search_cache.put(
+                            search_cache.cache_key(desc, _sc_lang),
+                            _sc_lang, search_cache.to_payload(out))
+                    except Exception:
+                        log.warning("search cache put failed", exc_info=True)
                 return
         # dead end: every attempt failed or was gated out by match quality
         if best.score >= _DROP_TOLERANCE:
@@ -1850,6 +1900,15 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                 bio=cached.get("bio") or "",
                 bio_about="artist" if cached.get("bio") else "",
             )
+            # canonize cached cards too: pre-fix rows may still carry a film
+            # title as the artist; normal artists fast-path with no network
+            try:
+                _canon_c = await canonize_artist(
+                    cached_meta.artist, cached_meta.track, metadata_svc)
+                if _canon_c:
+                    cached_meta.artist = _canon_c
+            except Exception:
+                log.debug("canonize_artist (cached card) failed %s", track.video_id)
             # Auto-facts were removed — the sonar fact is button-only (💡;
             # $0.008 a call; 30d cache). Sonar stays ONLY as a fallback for an empty bio.
             if not _clean_bio(cached_meta.bio):
@@ -1995,6 +2054,12 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                 {"title": track.title, "channel": _ch0,
                  "uploader": _ch0, "id": track.video_id},
                 track.video_id)
+            try:
+                _canon0 = await canonize_artist(meta0.artist, meta0.track, metadata_svc)
+                if _canon0:
+                    meta0.artist = _canon0
+            except Exception:
+                log.debug("canonize_artist (early card) failed %s", track.video_id)
         except Exception:
             meta0 = None
     _aw0 = getattr(meta0, "artwork_url", "") if meta0 else ""
@@ -2091,6 +2156,12 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
         try:
             if not _meta_l2:
                 meta = await metadata_svc.resolve(info, track.video_id)
+                try:
+                    _canon = await canonize_artist(meta.artist, meta.track, metadata_svc)
+                    if _canon:
+                        meta.artist = _canon
+                except Exception:
+                    log.debug("canonize_artist failed %s", track.video_id)
                 try:
                     await mc.put_track(track.video_id, {
                         k: v for k, v in {

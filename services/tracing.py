@@ -126,7 +126,8 @@ class SearchTrace:
     """A single search request. Without init() all methods are no-op: pipeline
     call sites are unconditional, tracing must not affect the search."""
 
-    def __init__(self, trace_id: str, user_id: int, chat_id: int | None, description: str):
+    def __init__(self, trace_id: str, user_id: int, chat_id: int | None, description: str,
+                 name: str = "search"):
         self.trace_id = trace_id
         self.user_id = user_id
         self.chat_id = chat_id
@@ -147,9 +148,17 @@ class SearchTrace:
                 environment=(_environment or None),
             )
             self._ctx.__enter__()
+            # name the TRACE itself: an observation-only start leaves the
+            # trace unnamed (empty trace_name in the UI/ClickHouse) and
+            # diagnostics had to identify traces by timestamp alone
+            try:
+                _client.trace(id=trace_id, name=name,
+                              input=redact_for_log(description, max_len=400))
+            except Exception:
+                pass  # an SDK without the upsert just leaves the trace unnamed
             self._root = _client.start_observation(
                 trace_context=TraceContext(trace_id=trace_id),
-                name="search", input=redact_for_log(description, max_len=400),
+                name=name, input=redact_for_log(description, max_len=400),
             )
         except Exception as e:
             _log.warning("langfuse trace start failed: %s", e)

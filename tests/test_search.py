@@ -1,7 +1,34 @@
 import asyncio
+import concurrent.futures
 import pytest
 from unittest.mock import patch
 from services.search import _normalize, _normalize_sc, search_metadata, enrich_candidates
+
+
+class _InlineExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Deterministic executor: runs the submitted work synchronously, in submit.
+
+    search_metadata sends each yt extraction to the loop's default thread pool
+    (run_in_executor). Which worker thread gets there first, and whether a
+    still-pending thread runs its mock before the test asserts, is wall-clock
+    luck: on a loaded CI runner the call counter landed anywhere in 2..4 while
+    this test asserted exactly _WINDOW (CI run 43236361531: assert 2 == 3).
+    Running extractions inline freezes the interleaving: every window task
+    completes inside its first loop step, before the harvester loop resumes.
+    Subclasses ThreadPoolExecutor only because set_default_executor enforces
+    the type; no real thread is ever started (submit never reaches the base).
+    """
+
+    def __init__(self):
+        super().__init__(max_workers=1)
+
+    def submit(self, fn, /, *args, **kwargs):
+        fut = concurrent.futures.Future()
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # pragma: no cover - mirrors executor contract
+            fut.set_exception(exc)
+        return fut
 
 
 def test_normalize_sc_valid():
@@ -215,6 +242,9 @@ async def test_early_exit_pool_target(monkeypatch):
 
     monkeypatch.setattr(S, "_extract_one", fake_yt)
     monkeypatch.setattr(S, "_extract_one_sc", fake_sc)
+    # Freeze the scheduling: extractions run inline instead of on racy worker
+    # threads (the loop is per-test, so no restore needed).
+    asyncio.get_running_loop().set_default_executor(_InlineExecutor())
     out = await S.search_metadata(["q1", "q2", "q3", "q4"], per_query=20)
     assert calls["sc"] == 0                     # SC skipped: pool already full from yt
     assert S._POOL_TARGET <= len(out) <= S._POOL_TARGET + S._WINDOW * 30

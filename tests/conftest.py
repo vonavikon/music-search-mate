@@ -242,6 +242,15 @@ def _isolate_meta_cache(request):
     _saved = {n: getattr(_real_mc, n) for n in _names}
     for n in _names:
         setattr(_real_mc, n, AsyncMock(return_value=None))
+    # the exact-repeat cache is DB-backed too: same isolation, so handler
+    # tests never touch data/bot-search-cache.db (pure helpers stay real)
+    _sc = _pytest.importorskip("services.search_cache")
+    _sc_names = ("get", "put", "init", "aclose")
+    _sc_saved = {n: getattr(_sc, n) for n in _sc_names}
+    for n in _sc_names:
+        setattr(_sc, n, AsyncMock(return_value=None))
     yield
     for n, fn in _saved.items():
         setattr(_real_mc, n, fn)
+    for n, fn in _sc_saved.items():
+        setattr(_sc, n, fn)
