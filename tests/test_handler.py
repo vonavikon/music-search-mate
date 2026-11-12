@@ -1926,7 +1926,9 @@ def test_bot_commands_localized_lists():
     assert ru and en
     assert all(isinstance(c, BotCommand) for c in ru + en)
     assert [c.command for c in ru] == [c.command for c in en]
-    assert {"start", "help", "lang", "new", "stats", "donate"} <= {c.command for c in ru}
+    # /stats is owner-only (hidden from the public menu, 12.11)
+    assert {"start", "help", "lang", "new", "donate"} <= {c.command for c in ru}
+    assert "stats" not in {c.command for c in ru}
     for r, e in zip(ru, en):
         assert r.description and e.description
         assert r.description != e.description  # actually localized, not copies

@@ -56,6 +56,8 @@ El pipeline completo, de la descripción libre al archivo descargado (el esquema
 - **Datos ligados a la grabación:** el botón 💡 lleva la clase de grabación (estudio o en vivo) de la tarjeta pulsada; la tarjeta de estudio y la de concierto de la misma canción cuentan datos distintos.
 - **Repetir 💡 muestra el dato de nuevo:** el dato reaparece en su sitio, nunca como un puntero "ver más arriba".
 - **Bios limpias:** la plantilla de Last.fm "multiple artists with this name" se elimina de las líneas sobre el artista.
+- **Repeticiones instantáneas:** una consulta limpia idéntica ya respondida se repite desde caché en ~0,1 s sin llamadas al modelo; las protecciones de no-repetición y estudio-primero se aplican en cada repetición.
+- **Artista correcto en la ficha:** cuando el título del video esconde al intérprete tras el nombre de una película o serie ("Fight Club - This Is Your Life"), la ficha muestra al artista real (The Dust Brothers) vía Last.fm.
 - **Compuertas anti inyección de prompt:** las frases de manipulación conocidas ("ignora las instrucciones anteriores" y equivalentes en ruso, intentos colados por el canal de reinicio "no es esto:") se cortan antes de la primera llamada al LLM, así que un ataque cuesta cero llamadas al modelo; un prefiltro aparte detiene las peticiones destructivas de "cómo hacer" disfrazadas de búsquedas de canciones. La batería de entradas hostiles (extracción de prompt, evasiones, inyecciones) forma parte de la suite de pruebas.
 - **Cachés:** file_id de Telegram (un tema enviado antes se reenvía sin descargarlo de nuevo), caché de datos, pools de similares, consultas a Last.fm con TTL.
 - **Grupos:** el bot reacciona solo a las @menciones (modo de privacidad desactivado más un filtro explícito en el código); los límites por usuario se aplican en todas partes.
@@ -127,7 +129,7 @@ tests/                        301 tests, offline mocks, pytest
 
 ## Estado
 
-Un proyecto personal con un solo mantenedor. Versión 1.20.1 (noviembre de 2026); la instancia pública ejecuta este código.
+Un proyecto personal con un solo mantenedor. Versión 1.21.0 (noviembre de 2026); la instancia pública ejecuta este código.
 
 El proyecto creció del uso real, no de una hoja de ruta: las variantes subidas ralentizadas y aceleradas rompían las etiquetas y las portadas hasta que el filtro de candidatos aprendió a descartarlas; el modo de grupos se rehizo tras las quejas de grupos reales; el servidor local de la Bot API apareció cuando el techo de 50 MB de la nube se convirtió en el límite real.
 

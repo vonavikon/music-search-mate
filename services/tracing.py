@@ -148,14 +148,12 @@ class SearchTrace:
                 environment=(_environment or None),
             )
             self._ctx.__enter__()
-            # name the TRACE itself: an observation-only start leaves the
-            # trace unnamed (empty trace_name in the UI/ClickHouse) and
-            # diagnostics had to identify traces by timestamp alone
-            try:
-                _client.trace(id=trace_id, name=name,
-                              input=redact_for_log(description, max_len=400))
-            except Exception:
-                pass  # an SDK without the upsert just leaves the trace unnamed
+            # NB (SDK 4.x): there is no client.trace()/update_trace() - the
+            # trace NAME in the UI is the ROOT OBSERVATION name, so `name`
+            # below (the query text) is what identifies the trace; the
+            # ClickHouse trace_name column stays empty by design in this
+            # ingestion mode - SQL diagnostics read argMin(name, start_time)
+            # per trace_id instead.
             self._root = _client.start_observation(
                 trace_context=TraceContext(trace_id=trace_id),
                 name=name, input=redact_for_log(description, max_len=400),

@@ -254,7 +254,6 @@ def bot_commands(lang: str) -> list[BotCommand]:
         ("help", "как искать и что значат кнопки"),
         ("lang", "язык ответов"),
         ("new", "начать поиск с чистого листа"),
-        ("stats", "цифры за сегодня"),
         ("donate", "поддержать проект"),
     ]
     en = [
@@ -262,7 +261,6 @@ def bot_commands(lang: str) -> list[BotCommand]:
         ("help", "how to search and what the buttons mean"),
         ("lang", "answer language"),
         ("new", "start a fresh search"),
-        ("stats", "today's numbers"),
         ("donate", "support the project"),
     ]
     return [BotCommand(c, d) for c, d in (en if lang == "en" else ru)]

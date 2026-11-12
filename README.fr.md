@@ -56,6 +56,8 @@ Le schéma du pipeline ci-dessous est laissé en anglais pour préserver l'align
 - **Faits liés à l'enregistrement:** le bouton 💡 porte la classe d'enregistrement (studio ou live) de la fiche sur laquelle on appuie; la fiche studio et la fiche concert d'une même chanson racontent des faits différents.
 - **Répéter 💡 réaffiche le fait:** le fait réapparaît à sa place, jamais sous forme de renvoi « voir plus haut ».
 - **Bios propres:** la mention standard de Last.fm « multiple artists with this name » est retirée des lignes sur l'artiste.
+- **Répétitions instantanées:** une même requête propre déjà traitée est rejouée depuis le cache en ~0,1 s sans appel au modèle; les garde-fous anti-répétition et studio-d'abord s'appliquent à chaque rejeu.
+- **Le bon artiste sur la fiche:** quand le titre de la vidéo cache l'interprète derrière un nom de film ou de série ("Fight Club - This Is Your Life"), la fiche affiche le véritable artiste (The Dust Brothers) via Last.fm.
 - **Barrières anti injection de prompt:** les formulations de manipulation connues ("ignore les instructions précédentes" et équivalents russes, tentatives passées par le canal de redémarrage "pas ça:") sont coupées avant le premier appel au LLM, donc une attaque coûte zéro appel au modèle; un préfiltre séparé arrête les demandes destructrices de type "comment faire" déguisées en recherche de chanson. La batterie d'entrées hostiles (extraction de prompt, évasions, injections) fait partie de la suite de tests.
 - **Caches:** file_id Telegram (un morceau déjà envoyé est renvoyé sans retéléchargement), cache des faits, pools de morceaux similaires, consultations Last.fm avec TTL.
 - **Groupes:** le bot ne réagit qu'aux @mentions (mode confidentialité désactivé plus un garde-fou explicite dans le code); les limites par utilisateur s'appliquent partout.
@@ -127,7 +129,7 @@ tests/                        301 tests, offline mocks, pytest
 
 ## Statut
 
-Un projet personnel avec un seul mainteneur. Version 1.20.1 (novembre 2026); l'instance publique exécute ce code.
+Un projet personnel avec un seul mainteneur. Version 1.21.0 (novembre 2026); l'instance publique exécute ce code.
 
 Le projet a grandi à partir d'un usage réel, pas d'une feuille de route: les variantes ralenties et accélérées des morceaux cassaient les tags et les pochettes jusqu'à ce que le filtre de candidats apprenne à les écarter; le mode groupes a été refait après des plaintes venant de vrais chats de groupe; le serveur Bot API local est apparu quand le plafond cloud de 50 Mo est devenu la limite réelle.
 
