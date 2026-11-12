@@ -52,6 +52,10 @@ El pipeline completo, de la descripción libre al archivo descargado (el esquema
 - **Sin repeticiones:** "más como esto" no vuelve a entregar pistas enviadas hace poco, aunque la misma canción reaparezca bajo la portada de un canal de fans; cuando no hay un candidato nuevo fiable, el bot repite honestamente la opción fuerte en vez de sacar relleno de la cola.
 - **"Sorpréndeme" sigue siendo una sorpresa:** la petición siempre significa "pon algo inesperado"; el contexto de la pista anterior nunca la convierte en silencio en "más de lo mismo".
 - **Fichas limpias:** el veredicto del modelo son datos sobre el artista y la pista; un sanitizador elimina los consejos inventados (sugerencias sobre etiquetas de archivo y similares) en cada punto de renderizado.
+- **Caché persistente de metadatos:** las tarjetas de temas, las bios de artistas (EN más traducciones al ruso compradas una sola vez), los datos y 2000+ portadas de álbum pregeneradas sobreviven a los reinicios en una caché LRU de 10 GiB con TTL deslizante; un tema repetido se resuelve al instante y a iTunes y Last.fm se les pregunta una vez por tema.
+- **Datos ligados a la grabación:** el botón 💡 lleva la clase de grabación (estudio o en vivo) de la tarjeta pulsada; la tarjeta de estudio y la de concierto de la misma canción cuentan datos distintos.
+- **Repetir 💡 muestra el dato de nuevo:** el dato reaparece en su sitio, nunca como un puntero "ver más arriba".
+- **Bios limpias:** la plantilla de Last.fm "multiple artists with this name" se elimina de las líneas sobre el artista.
 - **Compuertas anti inyección de prompt:** las frases de manipulación conocidas ("ignora las instrucciones anteriores" y equivalentes en ruso, intentos colados por el canal de reinicio "no es esto:") se cortan antes de la primera llamada al LLM, así que un ataque cuesta cero llamadas al modelo; un prefiltro aparte detiene las peticiones destructivas de "cómo hacer" disfrazadas de búsquedas de canciones. La batería de entradas hostiles (extracción de prompt, evasiones, inyecciones) forma parte de la suite de pruebas.
 - **Cachés:** file_id de Telegram (un tema enviado antes se reenvía sin descargarlo de nuevo), caché de datos, pools de similares, consultas a Last.fm con TTL.
 - **Grupos:** el bot reacciona solo a las @menciones (modo de privacidad desactivado más un filtro explícito en el código); los límites por usuario se aplican en todas partes.
@@ -123,7 +127,7 @@ tests/                        301 tests, offline mocks, pytest
 
 ## Estado
 
-Un proyecto personal con un solo mantenedor. Versión 1.17 (noviembre de 2026); la instancia pública ejecuta este código.
+Un proyecto personal con un solo mantenedor. Versión 1.20.1 (noviembre de 2026); la instancia pública ejecuta este código.
 
 El proyecto creció del uso real, no de una hoja de ruta: las variantes subidas ralentizadas y aceleradas rompían las etiquetas y las portadas hasta que el filtro de candidatos aprendió a descartarlas; el modo de grupos se rehizo tras las quejas de grupos reales; el servidor local de la Bot API apareció cuando el techo de 50 MB de la nube se convirtió en el límite real.
 

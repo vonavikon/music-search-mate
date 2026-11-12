@@ -346,7 +346,6 @@ async def set_user_lang(user_id: int, lang: str) -> None:
 
 async def get_usage(user_id: int, day: str | None = None) -> dict:
     """The user's usage counters for a day. day defaults to today."""
-    import datetime as _dt
     day = day or _utc_today()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -367,7 +366,6 @@ async def incr_usage(user_id: int, field: str, amount: int = 1) -> None:
     rest (NULL+1=NULL, caps silently never fired). COALESCE in UPDATE additionally
     heals pre-existing NULL rows between restarts."""
     assert field in ("searches", "urls", "facts", "videos", "sends", "bytes_sent")
-    import datetime as _dt
     day = _utc_today()
     vals = {"searches": 0, "urls": 0, "facts": 0, "videos": 0,
             "sends": 0, "bytes_sent": 0}
@@ -387,7 +385,6 @@ async def incr_usage(user_id: int, field: str, amount: int = 1) -> None:
 
 async def get_global_usage(day: str | None = None) -> dict:
     """Total usage of ALL users for a day (global budget)."""
-    import datetime as _dt
     day = day or _utc_today()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(

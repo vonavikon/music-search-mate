@@ -218,3 +218,30 @@ def _no_yt_suggest_network(monkeypatch):
     suggest_mod._CACHE.clear()
     yield
     suggest_mod._CACHE.clear()
+
+
+# ---------- meta cache isolation (12.11) ----------
+# handler code calls services.meta_cache at card/fact/bio/artwork sites;
+# unpatched tests used to open the REAL data/meta-cache.db and a hit from a
+# previous run silently changed control flow (head-start test flake). Every
+# test gets a no-op cache unless it opts in with @pytest.mark.real_meta_cache
+# (the port tests exercise the real module against temp dirs).
+import pytest as _pytest
+
+_real_mc = _pytest.importorskip("services.meta_cache")
+
+
+@_pytest.fixture(autouse=True)
+def _isolate_meta_cache(request):
+    if request.node.get_closest_marker("real_meta_cache"):
+        yield
+        return
+    from unittest.mock import AsyncMock
+    _names = ("get_track", "put_track", "get_bio", "put_bio", "get_fact",
+              "put_fact", "artwork_path", "store_artwork", "init", "aclose")
+    _saved = {n: getattr(_real_mc, n) for n in _names}
+    for n in _names:
+        setattr(_real_mc, n, AsyncMock(return_value=None))
+    yield
+    for n, fn in _saved.items():
+        setattr(_real_mc, n, fn)

@@ -53,6 +53,10 @@ Behind that common spine, the tail of the flow is split by intent: a router (`se
 - **No repeats:** "more like this" avoids re-serving tracks delivered recently, even when the same song resurfaces under a fan-channel cover; when nothing fresh is trustworthy, the bot honestly repeats the strong pick instead of digging up tail junk.
 - **"Surprise me" stays a surprise:** the request always means "play something unexpected"; the previous track's context never quietly turns it into "more like the last one".
 - **Clean verdict cards:** the model's verdict is facts about the artist and the track; a sanitizer strips invented advice (file-tag tips and the like) at every render point.
+- **Persistent metadata cache:** track cards, artist bios (EN plus bought-once RU translations), facts and 2000+ prebuilt album covers survive restarts in a 10 GiB LRU cache with a sliding TTL; a repeated track resolves instantly, and iTunes and Last.fm are asked once per track.
+- **Facts bound to the record:** the 💡 button carries the record class (studio vs live) of the pressed card; the studio card and the concert card of the same song tell different facts.
+- **Repeat 💡 shows the fact again:** the fact reappears in place, never a "see above" pointer.
+- **Clean bios:** Last.fm's "multiple artists with this name" boilerplate is stripped from About-artist lines.
 - **Caches:** Telegram file_id (a track sent before is re-sent without downloading again), fact cache, similar pools, Last.fm lookups with a TTL.
 - **Groups:** the bot reacts only to @mentions (privacy mode off plus an explicit gate in code); per-user limits apply everywhere. Groups with Telegram slow mode are handled: the bot waits out the window once (up to 45 s, with a status note) and, if Telegram still refuses, tells the admins plainly instead of burning through candidates.
 - **Graceful degradation:** when the LLM gateway is down, the bot says so ("the AI is unavailable for a moment, going the simple way for now") and shows a pick-list of raw search results instead of silently auto-sending whatever the search topped with; one 5xx costs one attempt, not three.
@@ -128,7 +132,7 @@ tests/                        612 tests, offline mocks, pytest
 
 ## Status
 
-A pet project with one maintainer. Version 1.20 (November 2026); the public instance runs this code.
+A pet project with one maintainer. Version 1.20.1 (November 2026); the public instance runs this code.
 
 The project grew from real usage, not a roadmap: slowed-down and sped-up upload variants were breaking tags and artwork until the candidate filter learned to drop them; group mode was rebuilt after complaints from live group chats; the local Bot API server appeared when the 50 MB cloud ceiling became the actual limit.
 

@@ -48,6 +48,10 @@ from services.tracing import SearchTrace, score_feedback
 from services.metadata import MetaOut, pretty_title
 from services.media import cleanup_temp, _DEFAULT_VIDEO_QUALITY
 from services import tag_enrichment
+from services.broadcast_texts import BROADCAST_TEXTS
+from services.pipelines.legacy import record_class
+from services import meta_cache as mc  # L2 persistent metadata cache; its calls never raise
+from services.name_clean import clean_channel_name
 
 log = logging.getLogger("bot.handler")
 _CLEANUP_EVERY = 10
@@ -172,8 +176,6 @@ _T = {
                    "en": "Couldn't download or send the video. Try a lower quality or audio."},
     "fact_ctx_lost": {"ru": "Контекст трека потерялся. Попроси этот трек ещё раз — тогда расскажу и факт.",
                       "en": "The track context is lost. Ask for the track again and I'll share the fact."},
-    "fact_dup": {"ru": "Этот факт уже чуть выше ⬆️",
-                 "en": "This fact is just above ⬆️"},
     "fact_cap_user": {"ru": "Факты на сегодня закончились — попробуй завтра.",
                       "en": "No more facts today, come back tomorrow."},
     "fact_cap_global": {"ru": "Факты на сегодня закончились у всех — попробуй завтра.",
@@ -343,12 +345,14 @@ def _kbt(lang: str, key: str) -> str:
 
 
 def _reply_keyboard(query_id: int, rank: int, keyboard: str, vid: str = "",
-                    lang: str = "ru") -> InlineKeyboardMarkup:
+                    lang: str = "ru", cls: str = "st") -> InlineKeyboardMarkup:
     """Keyboard under a track. URL fast-path — only "Похожее" (the user brought
     the track themselves); search — То/Не то/Уточнить/Похожее. The 💡 fact button
-    costs a sonar call ($0.008) and is generated only on demand (30d cache is free)."""
+    costs a sonar call ($0.008) and is generated only on demand (30d cache is free).
+    cls = record class of THIS card (st/lv): rides with the fact button so a
+    live card and a studio card carry different fact keys."""
     fact_btn = InlineKeyboardButton(
-        _kbt(lang, "fact"), callback_data=f"fact:{vid}") if vid else None
+        _kbt(lang, "fact"), callback_data=f"fact:{vid}|{cls}") if vid else None
     if keyboard == "url":
         rows = [[InlineKeyboardButton(_kbt(lang, "similar"), callback_data=f"sim:{query_id}:{rank}")]]
         if fact_btn:
@@ -426,9 +430,6 @@ def _resolve_video_ref(context, vid: str):
 # yt-dlp deals with the platform. Strip trailing punctuation (a period/comma/
 # bracket at the end of a sentence). Independent of the LLM, hence stable.
 _URL_RE = re.compile(r"https?://[^\s]+", re.I)
-
-_CONF_BADGE = {"high": "🎯", "medium": "🔎", "low": "🤔"}  # log-only; not shown on the card
-
 
 def _looks_like_url(text: str) -> str | None:
     """Extract a URL from text. Platform-agnostic — yt-dlp handles the rest.
@@ -759,6 +760,17 @@ def _discard_head(head) -> None:
                     pass
 
     head.fut.add_done_callback(_clean)
+
+
+def _bg(coro) -> "asyncio.Task":
+    """Fire-and-forget coroutine (L2 cache writes): the send path never waits
+    on the disk; a failure is logged, never surfaced to the user."""
+    async def _run():
+        try:
+            await coro
+        except Exception:
+            log.exception("background cache task failed")
+    return asyncio.create_task(_run())
 
 
 async def _drop_card(card) -> None:
@@ -1802,7 +1814,8 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
     parallel with the card, only a candidate fallback downloads inline-first."""
     metadata_svc = context.bot_data["metadata"]
     kb = _reply_keyboard(query_id, rank, keyboard, vid=track.video_id,
-                               lang=await _lang_of(update.effective_user.id))
+                               lang=await _lang_of(update.effective_user.id),
+                               cls=record_class(track.title))
 
     # Telegram draws an upload indicator while we download/tag/send
     async def _upload_action():
@@ -1840,17 +1853,25 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
             # Auto-facts were removed — the sonar fact is button-only (💡;
             # $0.008 a call; 30d cache). Sonar stays ONLY as a fallback for an empty bio.
             if not _clean_bio(cached_meta.bio):
-                cached_meta.bio = ""
-                cached_meta.bio = await _sonar_fact(
-                    context, update.effective_user.id,
-                    cached_meta.artist, cached_meta.track, cached_meta.year)
+                # L2 EN bio (free, cross-restart) before the paid sonar fallback
+                cached_meta.bio = await _bio_l2_en(cached_meta.artist)
+                if not _clean_bio(cached_meta.bio):
+                    cached_meta.bio = ""
+                    cached_meta.bio = await _sonar_fact(
+                        context, update.effective_user.id,
+                        cached_meta.artist, cached_meta.track, cached_meta.year)
             elif cached_meta.bio:
                 cached_meta.bio = await _translate_bio(
-                    context, update.effective_user.id, cached_meta.bio)
+                    context, update.effective_user.id, cached_meta.bio,
+                    cached_meta.artist)
             # photo card before the audio (a thumbnail doesn't render)
-            # album cover only (iTunes), no YouTube screenshots
+            # album cover only (iTunes), no YouTube screenshots. A local L2
+            # artwork file (meta_cache) beats the URL: no download, no refetch
             _aw = cached.get("artwork_url") or ""
-            if not _aw and cached_meta.artist and cached_meta.track:
+            _aw_l2 = await mc.artwork_path(cached_meta.artist, cached_meta.album or "")
+            if _aw_l2 and not Path(_aw_l2).exists():
+                _aw_l2 = None
+            if not _aw and not _aw_l2 and cached_meta.artist and cached_meta.track:
                 # Old cache rows (from before artwork_url existed) lack the URL —
                 # refetch the cover by the canonical pair and persist it to the cache
                 # so the self-heal doesn't repeat on every hit
@@ -1861,7 +1882,16 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                         await update_cached_artwork(track.video_id, _aw)
                     except Exception:
                         log.exception("update_cached_artwork failed %s", track.video_id)
-            if _aw:
+                    # warm the L2 artstore too (local-first on the next hit)
+                    _bg(mc.store_artwork(cached_meta.artist, cached_meta.album or "", _aw))
+            if _aw_l2:
+                try:
+                    with open(_aw_l2, "rb") as _cf:
+                        await update.effective_chat.send_photo(
+                            photo=InputFile(_cf, filename="cover.jpg"))
+                except Exception as e:
+                    log.debug("cover photo (l2 file) not sent: %s", str(e)[:80])
+            elif _aw:
                 try:
                     await update.effective_chat.send_photo(photo=_aw)
                 except Exception as e:
@@ -1944,21 +1974,55 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
     # ID quality); the metadata TTL cache absorbs the second resolve's
     # overlapping Last.fm/iTunes calls. No album cover = no photo.
     card = None
+    meta0 = None
+    _meta0_l2 = False
+    # L2 card cache (meta_cache): a video resolved once keeps its card data
+    # across restarts; a hit skips the early Last.fm/iTunes resolve entirely
     try:
-        meta0 = await metadata_svc.resolve(
-            {"title": track.title, "channel": track.channel,
-             "uploader": track.channel, "id": track.video_id},
-            track.video_id)
+        _c0 = await mc.get_track(track.video_id)
+        if _c0:
+            meta0 = _meta_from_cache(_c0)
+            _meta0_l2 = True
     except Exception:
         meta0 = None
+        _meta0_l2 = False
+    if meta0 is None:
+        try:
+            # the channel feeds the metadata cascade: strip channel-title litter
+            # ("Deep Purple Official" -> "Deep Purple") before the lookups
+            _ch0 = clean_channel_name(track.channel or "")
+            meta0 = await metadata_svc.resolve(
+                {"title": track.title, "channel": _ch0,
+                 "uploader": _ch0, "id": track.video_id},
+                track.video_id)
+        except Exception:
+            meta0 = None
     _aw0 = getattr(meta0, "artwork_url", "") if meta0 else ""
-    if _aw0:
+    # local artwork first (meta_cache): a cached cover file beats a URL send;
+    # the file belongs to the persistent artstore (NOT deleted with art0)
+    _aw0_l2 = None
+    if meta0:
+        _aw0_l2 = await mc.artwork_path(meta0.artist, meta0.album or "")
+        if _aw0_l2 and not Path(_aw0_l2).exists():
+            _aw0_l2 = None
+    if _aw0_l2:
+        try:
+            with open(_aw0_l2, "rb") as _cf:
+                card = await update.effective_chat.send_photo(
+                    photo=InputFile(_cf, filename="cover.jpg"))
+        except Exception as e:
+            log.debug("cover photo (l2 file) not sent: %s", str(e)[:80])
+    elif _aw0:
         try:
             card = await update.effective_chat.send_photo(photo=_aw0)
         except Exception as e:
             # not fatal (the audio goes anyway), but a silent swallow hid group
             # slow-mode rejections (03.11) — keep a trace
             log.debug("cover photo (head-start url) not sent: %s", str(e)[:80])
+        if not _meta0_l2:
+            # a fresh resolve produced the URL: warm the L2 artstore in the
+            # background (local-first on the next card of this album)
+            _bg(mc.store_artwork(meta0.artist, meta0.album or "", _aw0))
     else:
         _aw0p = getattr(meta0, "artwork_path", None) if meta0 else None
         if _aw0p and Path(_aw0p).exists():
@@ -2013,8 +2077,35 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                 _ua.cancel()
                 return False
         meta = None
+        # L2 card cache: a hit replaces the full resolve (the card data comes
+        # back as-is); a fresh resolve result goes into the cache on success
+        _meta_l2 = False
         try:
-            meta = await metadata_svc.resolve(info, track.video_id)
+            _cl2 = await mc.get_track(track.video_id)
+            if _cl2:
+                meta = _meta_from_cache(_cl2)
+                _meta_l2 = True
+        except Exception:
+            meta = None
+            _meta_l2 = False
+        try:
+            if not _meta_l2:
+                meta = await metadata_svc.resolve(info, track.video_id)
+                try:
+                    await mc.put_track(track.video_id, {
+                        k: v for k, v in {
+                            "artist": meta.artist, "title": meta.track,
+                            "album": meta.album, "year": meta.year,
+                            "genre": meta.genre, "bio": meta.bio,
+                            "artwork_url": meta.artwork_url,
+                        }.items() if v})
+                except Exception:
+                    # any resolve-shape change degrades to no-cache, not a crash
+                    log.exception("put_track failed %s", track.video_id)
+                await _bio_l2_put_en(meta.artist, meta.bio)
+                if meta.artwork_url:
+                    _bg(mc.store_artwork(meta.artist, meta.album or "",
+                                         meta.artwork_url))
             art = meta.artwork_path
             # enrich runs ffmpeg synchronously (subprocess.run up to 120s) — in a
             # thread only, otherwise it blocks the event loop and every chat (review 2026-09-03)
@@ -2031,12 +2122,16 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                                             meta.artist, meta.track)
 
         # The auto track fact was removed (💡 button under the card).
-        # Sonar stays as a fallback: Last.fm wiki empty -> a bio fact.
+        # Sonar stays as a fallback: Last.fm wiki empty -> a bio fact. The L2
+        # EN bio (free, survives restarts) sits between them: free before paid.
+        if meta and not meta.bio:
+            meta.bio = await _bio_l2_en(meta.artist)
         if meta and not meta.bio:
             meta.bio = await _sonar_fact(context, update.effective_user.id,
                                          meta.artist, meta.track, meta.year)
         if meta and meta.bio:
-            meta.bio = await _translate_bio(context, update.effective_user.id, meta.bio)
+            meta.bio = await _translate_bio(context, update.effective_user.id,
+                                            meta.bio, meta.artist)
         caption = _caption(meta, track, confidence, _sanitize_verdict(verdict))
         try:
             with open(m4a_path, "rb") as f:
@@ -2049,7 +2144,19 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                 # cover after all — no photo twice.
                 if card is None:
                     _aw_url = getattr(meta, "artwork_url", "") if meta else ""
-                    if _aw_url:
+                    _aw_l2c = (await mc.artwork_path(meta.artist, meta.album or "")
+                               if meta else None)
+                    if _aw_l2c and not Path(_aw_l2c).exists():
+                        _aw_l2c = None
+                    if _aw_l2c:
+                        # local L2 artwork beats a URL send
+                        try:
+                            with open(_aw_l2c, "rb") as _cf:
+                                await update.effective_chat.send_photo(
+                                    photo=InputFile(_cf, filename="cover.jpg"))
+                        except Exception as e:
+                            log.debug("cover photo (l2 file) not sent: %s", str(e)[:80])
+                    elif _aw_url:
                         try:
                             await update.effective_chat.send_photo(photo=_aw_url)
                         except Exception as e:
@@ -2075,24 +2182,31 @@ async def _send_track(update, context, status, media, query_id, rank, candidates
                 try:
                     if _aw_p and Path(_aw_p).exists() and Path(_aw_p).stat().st_size < 200_000:
                         _thumb_f = open(_aw_p, "rb")
-                    elif _aw_t:
-                        import httpx as _hx2
-                        async with _hx2.AsyncClient(timeout=10) as _cl:
-                            _r2 = await _cl.get(_aw_t)
-                        if _r2.status_code == 200 and len(_r2.content) < 200_000:
-                            _fd, _tp_name = tempfile.mkstemp(suffix=".jpg", prefix="tg_thumb_")
-                            try:
-                                os.write(_fd, _r2.content)
-                            except Exception:
-                                pass
-                            finally:
-                                # the raw fd doesn't leak if write fails
+                    else:
+                        _aw_t_l2 = (await mc.artwork_path(meta.artist, meta.album or "")
+                                    if meta else None)
+                        if _aw_t_l2 and Path(_aw_t_l2).exists() \
+                                and Path(_aw_t_l2).stat().st_size < 200_000:
+                            # local L2 artwork beats an httpx round trip
+                            _thumb_f = open(_aw_t_l2, "rb")
+                        elif _aw_t:
+                            import httpx as _hx2
+                            async with _hx2.AsyncClient(timeout=10) as _cl:
+                                _r2 = await _cl.get(_aw_t)
+                            if _r2.status_code == 200 and len(_r2.content) < 200_000:
+                                _fd, _tp_name = tempfile.mkstemp(suffix=".jpg", prefix="tg_thumb_")
                                 try:
-                                    os.close(_fd)
-                                except OSError:
+                                    os.write(_fd, _r2.content)
+                                except Exception:
                                     pass
-                            if Path(_tp_name).exists() and Path(_tp_name).stat().st_size > 0:
-                                _thumb_f = open(_tp_name, "rb")
+                                finally:
+                                    # the raw fd doesn't leak if write fails
+                                    try:
+                                        os.close(_fd)
+                                    except OSError:
+                                        pass
+                                if Path(_tp_name).exists() and Path(_tp_name).stat().st_size > 0:
+                                    _thumb_f = open(_tp_name, "rb")
                     async def _audio_send():
                         # a fresh InputFile per attempt: a rejected upload may
                         # leave the file pointer at EOF (a retry would send 0 bytes)
@@ -2202,6 +2316,39 @@ def _genre_line(meta) -> str:
 
 _BIO_MAX = 500  # the owner asked for longer (220 cut mid-word)
 
+# Last.fm wiki disambiguation boilerplate that opens many artist bios:
+# "There are multiple artists with this name..." / «На Last.fm отслеживается
+# несколько исполнителей с этим именем...». Not about the artist at all -
+# the sentence (and everything before it) goes, the real bio stays.
+_BIO_DISAMBIG_RE = re.compile(
+    r"(there\s+(are|is)\s+(at\s+least\s+)?(\d+|one|two|three|four|five|several|multiple)\b[^.]*?"
+    r"(artists?|bands?|musicians?)[^.]*?(\bname\b|tracked|last\.fm)"
+    r"|multiple\s+artists[^.]*"
+    r"|на\s+last\.fm\s+отслежива\w*[^.]*"
+    r"|есть\s+несколько\s+исполнител\w*[^.]*"
+    r"|несколько\s+исполнител\w*\s+с\s+этим\s+именем[^.]*"
+    r"|имя\s+которого\s+носят\s+несколько[^.]*)", re.I)
+
+
+def _strip_bio_disambiguation(bio: str) -> str:
+    """Drop the leading Last.fm 'multiple artists with this name' sentence.
+    The whole bio being only that -> '' (no info line at all)."""
+    b = (bio or "").strip()
+    if not b:
+        return ""
+    m = _BIO_DISAMBIG_RE.search(b[:400])
+    if not m:
+        return b
+    rest = b[m.end():].lstrip(" .,;:-–-")
+    if not rest:
+        return ""
+    # keep the sentence boundary after the boilerplate (the regex may have
+    # stopped mid-sentence at a '.'-less abbreviation)
+    dot = rest.find(". ")
+    if 0 <= dot < 3:
+        rest = rest[dot + 1:].lstrip()
+    return rest
+
 
 _BIO_GARBAGE_RE = re.compile(
     r"^(неверный|ошибка|invalid|error|not found|не найден|нет данных|no data|"
@@ -2225,6 +2372,9 @@ def _bio_line(meta) -> str:
     if not meta.bio:
         return ""
     raw = _strip_md(str(meta.bio).strip())
+    if not raw:
+        return ""
+    raw = _strip_bio_disambiguation(raw)
     if not raw:
         return ""
     if len(raw) > _BIO_MAX:
@@ -2258,13 +2408,78 @@ def _drop_duplicate(chat_id: int | None, text: str, window: float = 20.0) -> boo
     return False
 # and sonar facts repeat (24h in memory; facts are doubled by the persistent store.facts cache, 30d)
 
+# ---------- L2 persistent metadata cache (services.meta_cache) ----------
+# Cross-restart layer under the in-memory _TR_CACHE (24h) and store.facts (30d).
+# Contract: every mc.* call never raises (it logs and misses inside the module),
+# so the send paths below can await them bare. Bio/fact keys use the CLEANED
+# artist (clean_channel_name): "Deep Purple Official" and "Deep Purple" must
+# share one entry.
+
+
+def _mc_artist(artist: str) -> str:
+    """Artist key for the L2 caches: channel-title litter stripped; blank or
+    unknown names -> "" (no cache entry, a straight miss)."""
+    if not (artist or "").strip():
+        return ""
+    a = clean_channel_name(artist)
+    return "" if a == "Unknown Artist" else a
+
+
+async def _fact_l2(artist: str, track: str, lang: str) -> str:
+    """A fact from the L2 persistent cache. A hit heals L1 (store.save_fact)
+    so the 30d store cache takes over from the next press. Empty = miss."""
+    fact = await mc.get_fact(artist, track, lang)
+    if fact and len(fact) > 10:
+        try:
+            await save_fact(artist, track, lang, fact)
+        except Exception:
+            pass  # the L1 heal is best-effort; the reply goes out regardless
+        return fact
+    return ""
+
+
+async def _bio_l2_en(artist: str) -> str:
+    """An EN bio from the L2 persistent cache (the Last.fm original), keyed by
+    the cleaned artist. Empty = miss. Cheaper than a sonar fallback."""
+    a = _mc_artist(artist)
+    if not a:
+        return ""
+    return await mc.get_bio(a, "en") or ""
+
+
+async def _bio_l2_put_en(artist: str, bio: str) -> None:
+    """Store a fresh EN bio into L2: cheap insurance so a later card whose
+    resolve comes up empty still gets a bio (after a restart too)."""
+    a = _mc_artist(artist)
+    if a and bio:
+        await mc.put_bio(a, "en", bio)
+
+
+def _meta_from_cache(c: dict) -> MetaOut:
+    """MetaOut from an L2 cached card dict (mc.get_track). Only the fields the
+    cache wrote; the local artwork file is resolved lazily via artwork_path."""
+    return MetaOut(
+        artist=c.get("artist") or "",
+        track=c.get("title") or "",
+        album=c.get("album") or "",
+        year=c.get("year") or "",
+        genre=c.get("genre") or "",
+        bio=c.get("bio") or "",
+        bio_about="artist" if c.get("bio") else "",
+        artwork_url=c.get("artwork_url") or "",
+    )
+
 
 async def _sonar_fact(context, user_id: int, artist: str, track: str, year: str) -> str:
     """A fun fact about the track via sonar (web) when the Last.fm wiki is missing.
-    24h cache keyed by (artist+track, language); error/disabled = empty (card without ℹ️)."""
+    24h memory cache keyed by (artist+track, language) over the persistent L2
+    (meta_cache, cross-restart); error/disabled = empty (card without ℹ️)."""
     bothub = context.bot_data.get("bothub")
     if not bothub or not bothub.sonar_enabled or not (artist and track):
         return ""
+    # channel litter off the artist BEFORE any key/prompt: "Deep Purple
+    # Official" and "Deep Purple" must share one fact entry
+    artist = clean_channel_name(artist)
     try:
         lang = await get_user_lang(user_id) or "ru"
     except Exception:
@@ -2273,6 +2488,12 @@ async def _sonar_fact(context, user_id: int, artist: str, track: str, year: str)
     hit = _TR_CACHE.get(key)
     if hit and time.time() - hit[0] < 86400:
         return hit[1]
+    l2 = await _fact_l2(artist, track, lang)
+    if l2:
+        if len(_TR_CACHE) > 256:
+            _TR_CACHE.clear()
+        _TR_CACHE[key] = (time.time(), l2)
+        return l2
     lang_name = {"ru": "русском", "en": "English"}.get(lang, "русском")
     y = f", {year}" if year else ""
     out = await bothub.chat_text(
@@ -2285,6 +2506,9 @@ async def _sonar_fact(context, user_id: int, artist: str, track: str, year: str)
         if len(_TR_CACHE) > 256:
             _TR_CACHE.clear()
         _TR_CACHE[key] = (time.time(), out)
+        # persist for other chats and restarts; a sonar miss (empty) is NOT
+        # a fact and is never put
+        await mc.put_fact(artist, track, lang, out)
         return out
     return ""
 
@@ -2292,10 +2516,13 @@ async def _sonar_fact(context, user_id: int, artist: str, track: str, year: str)
 async def _sonar_track_fact(context, user_id: int, artist: str, track: str,
                             album: str = "", year: str = "") -> str:
     """A fun fact about the SPECIFIC track/album (not an artist bio).
-    sonar in the user's language. 24h cache. Empty = no fact (doesn't block the send)."""
+    sonar in the user's language. 24h memory cache over the persistent L2
+    (meta_cache, cross-restart). Empty = no fact (doesn't block the send)."""
     bothub = context.bot_data.get("bothub")
     if not bothub or not bothub.sonar_enabled or not (artist and track):
         return ""
+    # same key hygiene as _sonar_fact: channel litter off the artist
+    artist = clean_channel_name(artist)
     try:
         lang = await get_user_lang(user_id) or "ru"
     except Exception:
@@ -2304,6 +2531,12 @@ async def _sonar_track_fact(context, user_id: int, artist: str, track: str,
     hit = _TR_CACHE.get(key)
     if hit and time.time() - hit[0] < 86400:
         return hit[1]
+    l2 = await _fact_l2(artist, track, lang)
+    if l2:
+        if len(_TR_CACHE) > 256:
+            _TR_CACHE.clear()
+        _TR_CACHE[key] = (time.time(), l2)
+        return l2
     lang_name = {"ru": "русском", "en": "English"}.get(lang, "русском")
     ctx = f" (альбом: {album})" if album else ""
     y = f", {year}" if year else ""
@@ -2318,13 +2551,18 @@ async def _sonar_track_fact(context, user_id: int, artist: str, track: str,
         if len(_TR_CACHE) > 256:
             _TR_CACHE.clear()
         _TR_CACHE[key] = (time.time(), out)
+        # persist for other chats and restarts; a sonar miss (empty) is NOT
+        # a fact and is never put
+        await mc.put_fact(artist, track, lang, out)
         return out
     return ""
 
 
-async def _translate_bio(context, user_id: int, bio: str) -> str:
+async def _translate_bio(context, user_id: int, bio: str, artist: str = "") -> str:
     """The Last.fm bio arrives in English - translate it into the user's language
-    (asked at /start). The translation is cached; any error = the original, it never blocks the send."""
+    (asked at /start). The translation is cached in memory (24h) and in the
+    persistent L2 (meta_cache) keyed by the artist; any error = the original,
+    it never blocks the send."""
     try:
         lang = await get_user_lang(user_id)
     except Exception:
@@ -2335,6 +2573,13 @@ async def _translate_bio(context, user_id: int, bio: str) -> str:
     hit = _TR_CACHE.get(key)
     if hit and time.time() - hit[0] < 86400:
         return hit[1]
+    a = _mc_artist(artist)
+    if a:
+        # L2: a translated artist bio survives restarts and serves every card
+        # of that artist without a new LLM call
+        l2 = await mc.get_bio(a, "ru")
+        if l2:
+            return l2
     bothub = context.bot_data.get("bothub")
     if bothub is None:
         return bio
@@ -2347,6 +2592,8 @@ async def _translate_bio(context, user_id: int, bio: str) -> str:
         if len(_TR_CACHE) > 256:
             _TR_CACHE.clear()
         _TR_CACHE[key] = (time.time(), out)
+        if a:
+            await mc.put_bio(a, "ru", out)
         return out
     return bio
 
@@ -2586,6 +2833,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    # Broadcast language toggle (Nov 2026 release announcement): the card is
+    # sent once by scripts/broadcast.py; the EN/RU button swaps the text in
+    # place. Self-contained - no query_id, the message is static.
+    if kind == "bc":
+        lang = data[1] if len(data) > 1 and data[1] in BROADCAST_TEXTS else "ru"
+        other = "en" if lang == "ru" else "ru"
+        try:
+            await q.edit_message_text(
+                BROADCAST_TEXTS[lang],
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(other.upper(),
+                                         callback_data=f"bc:{other}")]]))
+        except Exception:
+            pass  # message deleted or too old - nothing to rescue
+        return
+
     # The 💡 fact button on a card. A sonar call is $0.008, hence: a 30d
     # persistent cache (free repeats), a per-user cap, a global budget for everyone.
     # The cache is checked BEFORE the limits (a cached fact is always free);
@@ -2593,19 +2856,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # on "не нашлось" (RU "nothing found") burn sonar past the caps; the id
     # is cut with split(":", 1) - foreign ":" inside the id.
     if kind == "fact":
-        vid = (q.data or "").split(":", 1)[1] if ":" in (q.data or "") else ""
+        _fpart = (q.data or "").split(":", 1)[1] if ":" in (q.data or "") else ""
+        vid, _, _fcls = _fpart.partition("|")
+        if _fcls not in ("lv", "st"):
+            _fcls = "st"  # old cards carry a bare "fact:vid": studio default
         if vid:
             await insert_event(user_id=update.effective_user.id, kind="fact", video_id=vid)
         if not vid:
             return
-        # Complaint: "дает просто повтор" (RU: "it just repeats"). A cache
-        # hit on a second press looked like
-        # a duplicate message. Now a second press within an hour gets a short
-        # pointer up the thread, not a duplicate fact.
-        _fs = context.chat_data.get(f"factshown:{vid}")
-        if _fs and time.time() - _fs < 3600:
-            await q.message.reply_text(await _t(update.effective_user.id, "fact_dup"))
-            return
+        # A repeated press shows the fact AGAIN, in place (owner 12.11:
+        # "факт должен еще раз появиться в том же месте"). The old 1h
+        # dup-pointer ("уже чуть выше") annoyed more than a repeat.
         try:
             row = await get_cached_file(vid) or {}
         except Exception:
@@ -2615,15 +2876,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (_f_artist and _f_track):
             await q.message.reply_text(await _t(update.effective_user.id, "fact_ctx_lost"))
             return
+        # channel litter off the artist BEFORE the keys: old cache rows may
+        # carry "Deep Purple Official" and L1/L2 must agree on "Deep Purple"
+        _f_artist = clean_channel_name(_f_artist)
+        # record class from the PRESSED CARD (the button carries it): a live
+        # take and the studio original cache - and ask for - different facts
+        # under the same song title (owner case 12.11: a Reading-festival
+        # fact served on the studio "Come As You Are" card)
+        _f_tkey = _f_track + (" (live)" if _fcls == "lv" else "")
         try:
             _f_lang = await get_user_lang(user.id) or "ru"
         except Exception:
             _f_lang = "ru"
-        _f_cached = await get_fact(_f_artist, _f_track, _f_lang)
+        _f_cached = await get_fact(_f_artist, _f_tkey, _f_lang)
         if _f_cached:
             # the cache is free: no sonar, no increments, limits not checked
-            context.chat_data[f"factshown:{vid}"] = time.time()
             await q.message.reply_text(f"💡 {_strip_md(_f_cached)}")
+            return
+        _f_l2 = await _fact_l2(_f_artist, _f_tkey, _f_lang)
+        if _f_l2:
+            # L2 hit: free like L1 (before the caps), and it heals L1 so the
+            # next press is answered by the store cache alone
+            await q.message.reply_text(f"💡 {_strip_md(_f_l2)}")
             return
         cfg = context.bot_data["cfg"]
         usage = await get_usage(user.id)
@@ -2644,16 +2918,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # the call itself costs money — increment before the call, whatever the outcome
         await incr_usage(user.id, "facts")
         fact = await _sonar_track_fact(
-            context, user.id, _f_artist, _f_track,
+            context, user.id, _f_artist, _f_tkey,
             row.get("album") or "", row.get("year") or "")
         if not fact:
             await q.message.reply_text(await _t(update.effective_user.id, "fact_none"))
             return
         try:
-            await save_fact(_f_artist, _f_track, _f_lang, fact)
+            await save_fact(_f_artist, _f_tkey, _f_lang, fact)
         except Exception:
             log.exception("save_fact failed")
-        context.chat_data[f"factshown:{vid}"] = time.time()
         await q.message.reply_text(f"💡 {_strip_md(fact)}")
         return
 

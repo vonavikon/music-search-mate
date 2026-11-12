@@ -15,13 +15,14 @@ The "music-expert" persona is baked into the system prompts (CHAR_PROMPT),
 import asyncio
 import json
 import logging
-import random
 import re
 import time
 import httpx
 from dataclasses import dataclass, field
 
-from services.search import search_metadata, enrich_candidates
+# enrich_candidates is a RE-EXPORT: pipelines/legacy.py imports it from here
+# (the orchestrator's historical import surface; import-cycle safety).
+from services.search import search_metadata, enrich_candidates  # noqa: F401
 # _clean_title is private but deliberately reused (not copied) for the
 # title-level rejection keys below — one noise-tail definition everywhere.
 from services.match_score import _clean_title, score_candidate
@@ -30,7 +31,7 @@ from services.observability import CircuitBreaker, emit_external, \
 from services.tracing import usage_details
 from services.metadata import _is_pseudo_artist
 from services import fuzzy
-from services.pipelines import PipelineContext, route, _normalize_intent
+from services.pipelines import PipelineContext, route
 # _same_record/_title_tokens (private, deliberately reused — one record
 # identity everywhere): the final same-record collapse at the search_candidates
 # choke point groups by the SAME relation the pre-rank diversity guard uses.
@@ -1864,7 +1865,6 @@ async def search_candidates(
 
     intent = extract.get("intent")
     signals = extract.get("signals") or {}
-    sonic = extract.get("sonic") or {}
     assoc = extract.get("association_candidates") or []
     reference = extract.get("reference") or {}
     target = extract.get("target") or {}

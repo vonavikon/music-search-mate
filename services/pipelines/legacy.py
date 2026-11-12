@@ -25,6 +25,18 @@ if TYPE_CHECKING:
 # so deployed log filters and dashboards see no change after the move.
 _log = logging.getLogger("bot.llm_search")
 
+# A live/concert recording marker in a video TITLE (EN/RU). Shared by the
+# live demotion below and the fact-button record class: facts about a live
+# take must not be served on a studio card (and vice versa).
+LIVE_RE = re.compile(r"\blive\b|\bвживую\b|\bконцерт", re.I)
+
+
+def record_class(title: str) -> str:
+    """'lv' when the title marks a live/concert recording, else 'st' (studio).
+    Threads into the 💡 fact key: the same song pressed on a live card and a
+    studio card asks for (and caches) different facts."""
+    return "lv" if LIVE_RE.search(title or "") else "st"
+
 
 class _Fields(NamedTuple):
     """The LLM#1 extract fields a pipeline tail works with. Mirrors the
@@ -365,7 +377,7 @@ async def _rank_and_decide(ctx: PipelineContext, f: _Fields, queries: list,
     # karaoke — keeps today's behavior, the this_track scene-title test
     # pins it). An explicitly REQUESTED version carries is_noise=False and
     # is untouched.
-    _live_re = re.compile(r"\blive\b|\bвживую\b|\bконцерт", re.I)
+    _live_re = LIVE_RE
     live_n = sum(1 for c in ranked
                  if getattr(c, "is_noise", False) and _live_re.search(c.title or ""))
     if live_n and ranked:
@@ -481,8 +493,6 @@ class LegacyPipeline(SearchPipeline):
 
         # Local aliases keep the moved body below textually identical to the
         # original orchestrator code (plain local names, not ctx attributes).
-        description = ctx.description
-        bothub = ctx.bothub
         trace = ctx.trace
         metadata_svc = ctx.metadata_svc
         t_start = ctx.t_start

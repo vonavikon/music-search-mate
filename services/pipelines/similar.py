@@ -144,7 +144,6 @@ class SimilarPipeline(SearchPipeline):
             # wave-3 s2: descriptor reference (the «как moby blues» query,
             # RU for "like moby blues") - see
             # _descriptor_ref_flag below for the two-signal rationale.
-            from services.llm_search import _ref_key
             ref_resolved["descriptor_ref"] = _descriptor_ref_flag(
                 reference, ref_resolved, queries)
             if ref_resolved["descriptor_ref"]:

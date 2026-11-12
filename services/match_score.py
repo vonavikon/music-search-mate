@@ -27,7 +27,7 @@ base = LLM rank score * 0.7 (relevance is the LLM's call, discounted for
 overconfidence) plus the same quality features. There is deliberately NO
 genre term: sharing signals.genre with the reference earns nothing — only
 the empirical getSimilar-neighbor boost in the rank tail moves similar
-scores. Thresholds: >= AUTO_THRESHOLD triggers auto-download, otherwise a
+scores. Thresholds: >= AUTO_SIMILAR triggers auto-download, otherwise a
 top-3 preview. The initial thresholds are meant to be retuned from
 production hit/miss feedback once match_score labels accumulate.
 """
@@ -43,7 +43,6 @@ AUTO_THIS_TRACK = 0.65
 # Preview cards with covers made visual picking the main UX for similar —
 # auto-download remains only for very confident matches.
 AUTO_SIMILAR = 0.85
-LOW_THRESHOLD = 0.4    # below this the card gets an "unsure" marker
 AMBIGUITY_GAP = 0.08   # top1-top2 match_score gap below this = ambiguous
 
 

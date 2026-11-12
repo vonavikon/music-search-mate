@@ -956,6 +956,23 @@ async def test_fact_button_cache_hit_free(app, fake_config):
 
 
 @pytest.mark.asyncio
+async def test_fact_button_repeat_shows_fact_again(app, fake_config):
+    """A second press re-shows the fact in place (owner 12.11: "факт должен
+    еще раз появиться в том же месте"), never the 'already above' pointer."""
+    cached_row = {"artist": "Queen", "track": "Bohemian Rhapsody",
+                  "album": "", "year": ""}
+    for _ in range(2):
+        update, context = _fact_update_and_context("fact:v1", fake_config)
+        with patch("bot.handler.get_cached_file", AsyncMock(return_value=cached_row)), \
+             patch("bot.handler.get_user_lang", AsyncMock(return_value="ru")), \
+             patch("bot.handler.get_fact", AsyncMock(return_value="Факт из кеша")):
+            await handle_callback(update, context)
+        texts = [c.args[0] for c in update.callback_query.message.reply_text.await_args_list]
+        assert any("Факт из кеша" in t for t in texts), "the fact itself must come back"
+        assert not any("выше" in t for t in texts), "no dup pointer anymore"
+
+
+@pytest.mark.asyncio
 async def test_fact_button_generates_sonar_and_persists(app, fake_config):
     """A cache miss -> a sonar-generated fact, written to the cache, with the user counter incremented."""
     update, context = _fact_update_and_context("fact:v1", fake_config)
@@ -2212,3 +2229,38 @@ def test_sanitize_verdict_strips_advice_keeps_facts():
     clean = "Mystère et suspense — сингл Fonky Family, 1998, дебютный альбом."
     assert _sanitize_verdict(clean) == clean
     assert _sanitize_verdict("") == ""
+
+
+@pytest.mark.asyncio
+async def test_fact_button_live_key_separate_from_studio(app, fake_config):
+    """A live card (fact:v1|lv) asks for and caches 'Track (live)'; the studio
+    key stays plain 'Track' so old cached studio facts keep serving (12.11)."""
+    from unittest.mock import AsyncMock as AM
+    cached_row = {"artist": "Nirvana", "track": "Come As You Are",
+                  "album": "", "year": ""}
+    # live press: L1 miss for the live key, sonar answers, save under the live key
+    update, context = _fact_update_and_context("fact:v1|lv", fake_config)
+    with patch("bot.handler.get_cached_file", AM(return_value=cached_row)), \
+         patch("bot.handler.get_user_lang", AM(return_value="ru")), \
+         patch("bot.handler.get_fact", AM(return_value=None)) as _get, \
+         patch("bot.handler._fact_l2", AM(return_value="")), \
+         patch("bot.handler.get_usage", AM(return_value={"facts": 0})), \
+         patch("bot.handler.get_global_usage", AM(return_value={"facts": 0})), \
+         patch("bot.handler.incr_usage", AM()), \
+         patch("bot.handler.save_fact", AM()) as _save, \
+         patch("bot.handler._sonar_track_fact", AM(return_value="Факт про Reading")) as _sonar, \
+         patch("bot.handler._maybe_wtp", AM()):
+        await handle_callback(update, context)
+    _get.assert_any_await("Nirvana", "Come As You Are (live)", "ru")
+    _sonar.assert_awaited_once()
+    assert "Come As You Are (live)" in str(_sonar.await_args)
+    assert "Come As You Are (live)" in str(_save.await_args)
+    # studio press (old-style bare button): the plain key, unchanged
+    update, context = _fact_update_and_context("fact:v1", fake_config)
+    with patch("bot.handler.get_cached_file", AM(return_value=cached_row)), \
+         patch("bot.handler.get_user_lang", AM(return_value="ru")), \
+         patch("bot.handler.get_fact", AM(return_value="студийный факт")) as _get2:
+        await handle_callback(update, context)
+    _get2.assert_any_await("Nirvana", "Come As You Are", "ru")
+    texts = [c.args[0] for c in update.callback_query.message.reply_text.await_args_list]
+    assert any("студийный факт" in t for t in texts)
