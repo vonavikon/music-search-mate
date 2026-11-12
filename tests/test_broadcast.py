@@ -72,6 +72,13 @@ def _dry(tmp_path):
         env=env, capture_output=True, text=True, check=True)
 
 
+# The sender script is private ops (not in the public mirror's include
+# list); the dry-run test runs only where the file exists.
+pytestmark = pytest.mark.skipif(
+    not (REPO / "scripts" / "broadcast.py").exists(),
+    reason="scripts/broadcast.py is not shipped in the public mirror")
+
+
 def test_script_dry_counts_and_dedup(tmp_path):
     db_path = tmp_path / "db.sqlite"
     _make_db(db_path)
