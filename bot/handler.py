@@ -51,7 +51,7 @@ from services import tag_enrichment
 from services.broadcast_texts import BROADCAST_TEXTS
 from services.pipelines.legacy import record_class
 from services import meta_cache as mc  # L2 persistent metadata cache; its calls never raise
-from services.name_clean import clean_channel_name
+from services.name_clean import clean_channel_name, strip_bio_disambiguation
 
 log = logging.getLogger("bot.handler")
 _CLEANUP_EVERY = 10
@@ -2316,38 +2316,10 @@ def _genre_line(meta) -> str:
 
 _BIO_MAX = 500  # the owner asked for longer (220 cut mid-word)
 
-# Last.fm wiki disambiguation boilerplate that opens many artist bios:
-# "There are multiple artists with this name..." / «На Last.fm отслеживается
-# несколько исполнителей с этим именем...». Not about the artist at all -
-# the sentence (and everything before it) goes, the real bio stays.
-_BIO_DISAMBIG_RE = re.compile(
-    r"(there\s+(are|is)\s+(at\s+least\s+)?(\d+|one|two|three|four|five|several|multiple)\b[^.]*?"
-    r"(artists?|bands?|musicians?)[^.]*?(\bname\b|tracked|last\.fm)"
-    r"|multiple\s+artists[^.]*"
-    r"|на\s+last\.fm\s+отслежива\w*[^.]*"
-    r"|есть\s+несколько\s+исполнител\w*[^.]*"
-    r"|несколько\s+исполнител\w*\s+с\s+этим\s+именем[^.]*"
-    r"|имя\s+которого\s+носят\s+несколько[^.]*)", re.I)
-
-
 def _strip_bio_disambiguation(bio: str) -> str:
-    """Drop the leading Last.fm 'multiple artists with this name' sentence.
-    The whole bio being only that -> '' (no info line at all)."""
-    b = (bio or "").strip()
-    if not b:
-        return ""
-    m = _BIO_DISAMBIG_RE.search(b[:400])
-    if not m:
-        return b
-    rest = b[m.end():].lstrip(" .,;:-–-")
-    if not rest:
-        return ""
-    # keep the sentence boundary after the boilerplate (the regex may have
-    # stopped mid-sentence at a '.'-less abbreviation)
-    dot = rest.find(". ")
-    if 0 <= dot < 3:
-        rest = rest[dot + 1:].lstrip()
-    return rest
+    """Delegate: the stripper lives in services.name_clean (shared with
+    the cache warmer); local name kept for the render sites and tests."""
+    return strip_bio_disambiguation(bio)
 
 
 _BIO_GARBAGE_RE = re.compile(

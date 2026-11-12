@@ -266,6 +266,8 @@ async def run_bio(pool: Sequence[str], mc: Any,
             await sleep(pause)
             continue
         if bio:
+            from services.name_clean import strip_bio_disambiguation
+            bio = strip_bio_disambiguation(bio) or bio
             await mc.put_bio(artist, "en", bio)
             saved += 1
         else:
@@ -280,7 +282,8 @@ async def select_ru_targets(pool: Sequence[str],
     """(artist, en_bio) for artists with a cached EN bio and no RU one."""
     targets: list[tuple[str, str]] = []
     for artist in pool:
-        en = await mc.get_bio(artist, "en")
+        from services.name_clean import strip_bio_disambiguation
+        en = strip_bio_disambiguation(await mc.get_bio(artist, "en"))
         if not en:
             continue
         if await mc.get_bio(artist, "ru"):
