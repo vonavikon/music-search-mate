@@ -546,28 +546,10 @@ async def test_non_music_candidate_dropped(bothub_client):
 
 
 # ════ pre-LLM gate ════
-
-def test_looks_artist_only():
-    from services.llm_search import _looks_artist_only
-    # a bare artist -> True
-    assert _looks_artist_only("AC/DC")
-    assert _looks_artist_only("Nirvana")
-    assert _looks_artist_only("Michael Jackson")
-    # a short track without an artist is caught too (1-3 tokens, no markers) —
-    # the gate turns it into clarify: better to ask than to guess
-    assert _looks_artist_only("Yesterday")
-    assert _looks_artist_only("Billie Jean")
-    # track markers -> False (not artist-only, proceed to search)
-    assert not _looks_artist_only("Nirvana - Smells Like Teen Spirit")
-    assert not _looks_artist_only("Smells Like Teen Spirit")  # 4 tokens
-    assert not _looks_artist_only("Blinding Lights (Official)")
-    assert not _looks_artist_only("50 Cent")
-    assert not _looks_artist_only("Song ft. Drake")
-    # a description / lowercase input -> False (not a proper name)
-    assert not _looks_artist_only("Хочу рок")
-    assert not _looks_artist_only("Хочу рок помягче")
-    assert not _looks_artist_only("test")
-
+# (2026-11-14, artist-only scenario) the bare-artist clarify branch and its
+# helper (_looks_artist_only) are GONE: a bare artist name is a legitimate
+# search that flows into LLM#1 (see tests/test_artist_scope.py for the
+# artist-only contract).
 
 def test_looks_like_code():
     from services.llm_search import _looks_like_code
@@ -581,9 +563,12 @@ def test_looks_like_code():
 
 def test_pre_search_gate():
     from services.llm_search import _pre_search_gate
-    # bare artist
+    # (2026-11-14, artist-only scenario) a bare artist is NOT gated anymore:
+    # the user wants that artist's songs — the search must run
     need, q = _pre_search_gate("AC/DC")
-    assert need and "AC/DC" in q
+    assert not need
+    need, q = _pre_search_gate("Depeche Mode")
+    assert not need
     # overly long input
     need, q = _pre_search_gate("x" * 2001)
     assert need and "Слишком длинный" in q
@@ -596,16 +581,23 @@ def test_pre_search_gate():
 
 
 @pytest.mark.asyncio
-async def test_gate_artist_only_skips_llm_and_search(bothub_client):
-    """"AC/DC" -> need_clarify BEFORE LLM#1: chat_json is not called."""
+async def test_gate_artist_only_flows_into_search(bothub_client):
+    """(2026-11-14, artist-only scenario) "AC/DC" now REACHES LLM#1 and the
+    YouTube search (formerly a deterministic clarify refused to search)."""
     with patch.object(bothub_client, "chat_json") as mock_chat:
+        mock_chat.side_effect = [
+            _extract_json(intent="this_track",
+                          target={"artist": "AC/DC", "track": None},
+                          queries=["AC/DC songs"]),
+            _rank_json(best_index=0),
+        ]
         with patch("services.llm_search.search_metadata") as mock_yt:
+            mock_yt.return_value = _yt_entries()
             out = await search_candidates("AC/DC", bothub_client)
-    assert out.need_clarify
-    assert "AC/DC" in out.clarify_question
-    assert out.candidates == []
-    mock_chat.assert_not_awaited()
-    mock_yt.assert_not_awaited()
+    assert not out.need_clarify
+    assert out.candidates, "the bare-artist query must produce results"
+    mock_chat.assert_awaited()
+    mock_yt.assert_awaited()
 
 
 @pytest.mark.asyncio

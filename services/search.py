@@ -23,6 +23,15 @@ log = logging.getLogger("services.search")
 _SEARCH_TIMEOUT = 60.0      # ytsearch: socket_timeout=30, retries=3
 _SEARCH_SC_TIMEOUT = 18.0   # scsearch (fallback phase): no longer on the main path
 _ENRICH_TIMEOUT = 45.0      # full extract_info: socket_timeout=20, retries=2
+# (2026-11-14) Incident 13.11 "F1 The Movie": the exact-title query (FIRST in
+# LLM#1's list) was still in flight when descriptive queries filled the pool
+# to _POOL_TARGET; the early-exit cancel threw its result away and the user
+# got a Warner Bros trailer instead of the song ("Bad As I Used To Be").
+# Grace for draining in-flight requests once the pool is full: finished
+# futures merge (even past the target), the still-pending ones are cancelled
+# after the grace. NEW requests are still not dispatched after the target
+# (early-exit latency win stands); nothing in flight -> zero added waiting.
+_DRAIN_GRACE = 8.0          # seconds: drain in-flight ytsearch after the pool fills
 
 # Target size of the unique-candidate pool (early exit from harvesting) and the
 # shortfall threshold below which SoundCloud kicks in. Production measurement:
@@ -126,8 +135,10 @@ async def search_metadata(queries: list[str], per_query: int = 20, on_progress=N
     """Parallel search across YouTube + SoundCloud (yt-first with early exit).
 
     Phase order: all YouTube queries run in parallel (as_completed); once the
-    unique-candidate pool reaches _POOL_TARGET, the unfinished ones are cancelled
-    (early exit: we used to churn 200+ results of which 1-3 get shown). SoundCloud
+    unique-candidate pool reaches _POOL_TARGET no NEW extractions are started,
+    and the ones still in flight are drained with a bounded grace (_DRAIN_GRACE,
+    2026-11-14) before cancellation (early exit: we used to churn 200+ results
+    of which 1-3 get shown). SoundCloud
     kicks in ONLY if YouTube underfilled below _POOL_FLOOR — a rare case, and it
     was exactly a hung scsearch that produced a latency tail at the SC timeout.
 
@@ -143,10 +154,13 @@ async def search_metadata(queries: list[str], per_query: int = 20, on_progress=N
                 timeout=_SEARCH_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            log.warning("ytsearch timeout for %r (>%.0fs)", q, _SEARCH_TIMEOUT)
+            # PII: текст запроса не логируем — только длину (паттерн
+            # web/app.py "search cancelled q_len=%d")
+            log.warning("ytsearch timeout q_len=%d (>%.0fs)",
+                        len(q), _SEARCH_TIMEOUT)
             return []
         except Exception as e:
-            log.warning("ytsearch failed for %r: %s", q, str(e)[:200])
+            log.warning("ytsearch failed q_len=%d: %s", len(q), str(e)[:200])
             return []
 
     async def one_sc(q: str) -> list[dict]:
@@ -156,10 +170,11 @@ async def search_metadata(queries: list[str], per_query: int = 20, on_progress=N
                 timeout=_SEARCH_SC_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            log.warning("scsearch timeout for %r (>%.0fs)", q, _SEARCH_SC_TIMEOUT)
+            log.warning("scsearch timeout q_len=%d (>%.0fs)",
+                        len(q), _SEARCH_SC_TIMEOUT)
             return []
         except Exception as e:
-            log.warning("scsearch failed for %r: %s", q, str(e)[:200])
+            log.warning("scsearch failed q_len=%d: %s", len(q), str(e)[:200])
             return []
 
     from services.match_score import _norm as _norm_for_dedup
@@ -219,7 +234,31 @@ async def search_metadata(queries: list[str], per_query: int = 20, on_progress=N
                    and len(merged) < _POOL_TARGET):
                 inflight.add(asyncio.ensure_future(one_yt(queue[next_i])))
                 next_i += 1
-            if not inflight or len(merged) >= _POOL_TARGET:
+            if not inflight:
+                break
+            if len(merged) >= _POOL_TARGET:
+                # (2026-11-14) Incident 13.11 "F1": the pool is full but
+                # requests are still in flight (the exact-title query racing
+                # faster descriptive ones). Don't drop them on the floor:
+                # drain with a bounded grace — finished futures merge as
+                # usual (even past the target), the ones still pending after
+                # the grace are cancelled as before. No NEW requests are
+                # dispatched from here (early exit preserved); when nothing
+                # is in flight this branch is never reached (zero extra
+                # latency for the common full-pool-no-inflight case).
+                done, pending = await asyncio.wait(inflight, timeout=_DRAIN_GRACE)
+                inflight = set()
+                for fut in done:
+                    try:
+                        _merge_yt(fut.result())
+                    except Exception:
+                        continue
+                for t in pending:
+                    if not t.done():
+                        t.cancel()
+                # PII: counters only, no query text (the q_len pattern above)
+                log.info("pool full: drained=%d cancelled=%d (grace=%.1fs, pool=%d)",
+                         len(done), len(pending), _DRAIN_GRACE, len(merged))
                 break
             done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
             for fut in done:

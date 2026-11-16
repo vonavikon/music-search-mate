@@ -61,7 +61,7 @@ SYSTEM_EXTRACT = CHAR_PROMPT + """
   "intent": "this_track | similar | from_source | mood | surprise",
   "signals": {"language": "...|null", "era": "напр. 1980s|null", "vocal": "male|female|instrumental|null", "genre": "...|null", "mood": "...|null"},
   "target": {"artist": "...|null", "track": "...|null"},
-  "reference": {"artist": "...|null", "track": "...|null"},
+  "reference": {"artist": "...|null", "track": "...|null", "source": "источник из запроса (фильм/игра/сериал/реклама, оригинальное написание)|null — только при intent=from_source"},
   "sonic": {"tempo": "...|null", "instrumentation": "...|null", "dynamics": "...|null", "vocal_timbre": "...|null"},
   "association_candidates": [{"artist": "...", "track": "...", "rationale": "почему этот артист звучит похоже на референс"}],
   "queries": ["3-5 строк для ytsearch, ПРЕИМУЩЕСТВЕННО английский, оптимизированных под нахождение трека на YouTube"],
@@ -73,8 +73,11 @@ SYSTEM_EXTRACT = CHAR_PROMPT + """
 - intent: this_track = конкретный трек (название/обрывок текста/ссылка); similar = похожий на референс; from_source = из фильма/рекламы/игры/сериала; mood = описание состояния, занятия или чувства БЕЗ конкретного трека и БЕЗ референса («музыка для бега», «грустная музыка для...», «трек как будто я узнал хорошую новость»). similar — ТОЛЬКО когда назван референс (трек/артист, ЧЬЁ звучание описано); без референса это mood. surprise = прямая просьба предложить незнакомое („удиви“, „не знаю, что хочу“, „surprise me“, „посоветуй что-нибудь новое“); если названо состояние или жанр («удиви чем-нибудь бодрым») — это mood, не surprise. queries при чистом surprise могут быть [].
 - ПРИОРИТЕТ ПРЯМОЙ ПРОСЬБЫ: слова «удиви» / „surprise me“ — ВСЕГДА intent=surprise; предыдущий контекст разговора ЭТО НЕ ОТМЕНЯЕТ (инцидент 11.11: после поисков «из фильма» одинокое «удиви» ушло в from_source и вернуло прошлый трек).
 - КОНТЕКСТ НЕ СОЗДАЁТ РЕФЕРЕНС: если в САМОМ запросе нет артиста/трека («музыка для бега», «песня про любовь») — это mood, даже если перед этим искали похожее на кого-то; референс из прошлой сессии переиспользуй только при явном продолжении («ещё такое же», «теперь быстрее»).
+- УНАСЛЕДОВАННЫЙ ИСТОЧНИК: если в САМОМ запросе фильма/игры/сериала/рекламы нет, а перед ним стоит блок «КОНТЕКСТ ИСТОЧНИКА» — этот источник действует и для текущего запроса: фрагменты-уточнения («нет, другую», «ее включали, когда они угнали машину») продолжают ТОТ же поиск, а не начинают новый (инцидент 12.11: ответы про «Мадагаскар 2» уходили в поиск без фильма). Используй этот источник запроса и верни его в reference.source; смена источника — только если новый назван явно.
+- ИСТОЧНИК ПЕРВОГО ПОИСКА (инцидент 14.11 F1): при intent=from_source ВСЕГДА возвращай в reference.source название источника ИЗ САМОГО запроса в оригинальном написании («формула 1»→"F1 The Movie", «мадагаскар»→Madagascar) — по нему работает память уточнений и посев саундтрека. Нет источника в запросе и в контексте — null.
 - target — конкретно искомый трек {artist, track} при intent=this_track (нужен для точного матчинга кандидата). Для similar/from_source/mood — {artist:null,track:null}. Не выдумывай: только если артист и название реально извлекаются из запроса.
-- reference — артист/трек, ЧЬЁ звучание описано (на что ищем похожее: «как Дурной вкус», «в духе Tame Impala»). Только при intent=similar, иначе {artist:null,track:null}. Это НЕ кандидат на выдачу. Не возвращай сам референс в результатах.
+- АРТИСТ БЕЗ ТРЕКА (инцидент 14.11): запрос = ТОЛЬКО имя исполнителя/группы, без трека и без описания звучания («depeche mode», «Кино», «P!nk») -> intent=this_track, target.artist = имя, target.track = null; это запрос песен ЭТОГО исполнителя, НЕ similar и НЕ mood. В queries — РАЗНЫЕ известные треки этого исполнителя (не одна песня с приписками).
+- reference — артист/трек, ЧЬЁ звучание описано (на что ищем похожее: «как Дурной вкус», «в духе Tame Impala»). artist/track — только при intent=similar, иначе null; source — только при intent=from_source (см. правила источника). Это НЕ кандидат на выдачу. Не возвращай сам референс в результатах.
 - sonic — звуковой отпечаток референса, КАК он звучит, а не в каком жанре: tempo (медленный/средний/быстрый, можно ~bpm), instrumentation (какие инструменты), dynamics (тихо/громко, нарастания), vocal_timbre (тембр вокала: хриплый/чистый/фальцет). Заполняй при intent=similar (отпечаток референса) и при intent=mood (перевод состояния в звук: какой темп, инструменты, динамика и вокал подходят под описание); иначе все null.
 - association_candidates — ПОХОЖИЕ артисты (кандидаты, КОТОРЫЕ хотим выдать), только при intent=similar. Иначе [] (при mood — всегда []).
 - mood_tags — реальные теги музыкальных сообществ Last.fm под состояние (running, workout, post-rock, instrumental, sad, electronic...). Только при intent=mood, иначе [].
@@ -133,6 +136,7 @@ _RANK_RULES_SIMILAR = """- similar: кандидат по ЗВУЧАНИЮ (св
 # the deterministic demotion in from_source.py keys on.
 _RANK_RULES_FROM_SOURCE = """- from_source: ЧИСТЫЙ АУДИОТРЕК (композиция саундтрека), НЕ видео-клип со сценой из фильма (диалоги, шумы, нарезка). «Сцена побега, часть 1» = мимо; «OST - Brooks Was Here» = то. Источник лишь описан и не совпадает — need_clarify, не угадывай.
 - Кандидат с cat=film или словами сцены/фрагмента/нарезки в названии = видео-клип сцены, в конец; ищем студийную композицию саундтрека.
+- Указана строка «Источник:» — саундтрек ДРУГОГО фильма/игры, не этого источника = сильный мимо: ставь низкий score, первым такой кандидат быть не может (инцидент 12.11: треки из Suicide Squad и Baby Driver обгоняли искомый саундтрек «Мадагаскара 2»).
 - need_clarify=true и без конкретного источника в кандидатах.
 """
 
@@ -148,6 +152,7 @@ _RANK_SKELETON_TAIL = """- Студийная версия предпочтит�
 - verdict — ТОЛЬКО факты о треке (исполнитель, название, год, альбом, источник). НИКАКИХ советов и просьб пользователю: никаких «пожалуйста, укажите/исправьте/переименуйте», упоминаний ID3-тегов, файлов, настроек — оформление файла не его и не твоя забота (инцидент 11.11: «Пожалуйста, укажите правильное имя исполнителя в ID3-тегах вашего файла»).
 
 need_clarify=true: запрос размыт — задай живой вопрос (clarify_question). Не уточняй при confidence high.
+- Вопрос-уточнение ОБЯЗАН быть полезным: для поиска «из фильма/игры/рекламы» спрашивай про СЦЕНУ или момент («что происходило на экране, когда играла музыка?»), НИКОГДА не проси исполнителя или название — пользователь их не знает, иначе бы не спрашивал (инцидент 13.11: «Уточните исполнителя или название» на поиске музыки из Формулы-1).
 - verdict — только факты, видимые в данных кандидатов или общеизвестные имена/годы. Порядок релизов („дебютный сингл“, „самый первый“, „последний“) НЕ утверждай, если он не назван в данных прямо: частая ошибка (wave-3b t4).
 
 Верни СТРОГО JSON (rationale максимум 5 слов, без объяснений):
@@ -277,6 +282,7 @@ class Candidate:
     fallback_url: str = ""       # alternative URL (another platform)
     canonical_year: str = ""     # card fact captions (from enrich top-5)
     canonical_album: str = ""
+    canonical_artist: str = ""   # official-first guard evidence (enrich top-5)
 
 
 @dataclass
@@ -294,6 +300,12 @@ class SearchOut:
     clarify_question: str = ""
     reference: dict = field(default_factory=dict)
     target: dict = field(default_factory=dict)
+    # (2026-11-14, artist-only scenario) Non-empty when the whole search is
+    # scoped to ONE artist (LLM#1: intent=this_track + target.artist, no
+    # track): the canonical artist name as the LLM returned it (.strip()).
+    # The handler keys on it (auto-download off for a "give me songs by X"
+    # browse); the pool guarantee runs inside search_candidates.
+    scope_artist: str = ""
     block: str = ""  # destructive-query category from LLM#1 ('' = clean)
     degraded: bool = False  # LLM-less fallback: raw YouTube order, no extract/rank
     trace: object = field(default=None, repr=False)  # SearchTrace: decision/final trace record
@@ -882,6 +894,51 @@ def _channel_key(channel: str) -> str:
     return _ref_key(ch)
 
 
+# (2026-11-14, artist-only scenario / incident 14.11) Pool-guarantee knobs:
+# with at least _SCOPE_MATCH_DROP matches of the scope artist in the final
+# pool, non-matches are dropped outright (the pool has enough of the
+# artist's own songs); below that they are only DEMOTED — every non-match
+# score is clamped to (weakest match score - _SCOPE_DEMOTE_GAP), so a
+# non-match can never outrank ANY match while a thin pool keeps its fillers
+# visible. The 0.05 margin mirrors the official-first guard's gap.
+_SCOPE_MATCH_DROP = 5
+_SCOPE_DEMOTE_GAP = 0.05
+
+
+def _scope_match(cand, scope_artist: str) -> bool:
+    """(2026-11-14, artist-only scenario) True when the candidate is a song
+    of the scope artist. Three evidences, any one suffices:
+      1. the channel, minus the YouTube Music ' - Topic' suffix, normalizes
+         (_channel_key) to the scope artist ("Depeche Mode - Topic");
+      2. the enriched canonical artist (top-5 enrich evidence, present on
+         Candidates and enriched dicts) normalizes (_ref_key) to the scope;
+      3. the artist name appears in the TITLE as whole words — word
+         boundary, case-insensitive (the _is_reference_candidate title
+         comparator: "depeche mode" matches "Depeche Mode - Enjoy the
+         Silence", never a glued substring).
+    Accepts a Candidate (attributes) or a raw/enriched dict (.get): the
+    choke-point guarantee sees Candidates, the rank format sees dicts."""
+    key = _ref_key(scope_artist or "")
+    if not key:
+        return False
+
+    def _f(name: str) -> str:
+        if isinstance(cand, dict):
+            return cand.get(name) or ""
+        return getattr(cand, name, "") or ""
+
+    if _channel_key(_f("channel")) == key:
+        return True
+    canon = _f("canonical_artist")
+    if canon and _ref_key(canon) == key:
+        return True
+    title_key = _ref_key(_f("title"))
+    if not title_key:
+        return False
+    pat = r"\b" + re.escape(key).replace(r"\ ", r"\s+") + r"\b"
+    return bool(re.search(pat, title_key))
+
+
 # ---------- title-level rejection (live-test F2, 2026-11-05) ----------
 # After two «Не то» on one song the restart still served the SAME song from
 # other channels: video_id + channel-key excludes missed the uploads that
@@ -1001,9 +1058,76 @@ _NON_MUSIC_TITLE_RE = re.compile(
     re.IGNORECASE)
 
 
+# --- trailer / film-studio guard (2026-11-14, F1 incident part A) ---
+# Prod incident (13-14.11, «F1 The Movie»): the official Warner Bros.
+# upload «F1® The Movie | Main Trailer» reached the top-3 preview and the
+# user downloaded a VIDEO FILE instead of the song. A trailer is never a
+# deliverable music candidate for ANY intent, whatever the search brought
+# it in for. Three hard signals, ANY one drops the candidate:
+#   1. the upload channel IS a film-studio marketing surface (exact studio
+#      names only — bare «A24» is deliberately absent, too wide);
+#   2. the pipe TAIL of the title («... | Main Trailer») names trailer
+#      titling — single words count ONLY there;
+#   3. the WHOLE title matches a multi-word trailer phrase.
+# Marker discipline mirrors _NON_MUSIC_TITLE_RE: a lone «trailer»/«teaser»
+# in the LEFT part (the band «Trailer Choirs», a song's «(Trailer)» tag)
+# is not trailer titling and must survive. Homoglyph-hardened: uploaders
+# dodge filters with l<->I swaps («OfficiaI Trailer» — capital i for l),
+# so every i/l position of the English markers is spelled [il].
+_STUDIO_CHANNEL_RE = re.compile(
+    r"\bwarner\s+bros|\bsony\s+pictures\b|\buniversal\s+pictures\b|"
+    r"\bparamount\b|\b20th\s+century\b|\bwalt\s+disney\s+studios\b|"
+    r"\bmovieclips\b|\bsearchlight\b|\ba24\s+films\b",
+    re.IGNORECASE)
+_TRAILER_TITLE_RE = re.compile(
+    r"\b(?:officia[il]|main|fina[il]|mov[il]e|teaser)\s+(?:trai[il]er|teaser)\b"
+    r"|\bfu[il][il]\s+mov[il]e\b"
+    r"|\bfeaturette\b"
+    r"|\bmov[il]e\s+preview\b",
+    re.IGNORECASE)
+_TRAILER_TAIL_RE = re.compile(
+    r"\btrai[il]er\b|\bteaser\b|\bfeaturette\b|\bpreview\b"
+    r"|\bfu[il][il]\s+mov[il]e\b|\bmov[il]e\s+preview\b",
+    re.IGNORECASE)
+# RU variants (2026-11-14): single words (трейлер/тизер) count only in the
+# pipe tail; the multi-word ones match the whole title too.
+_TRAILER_TITLE_RE_RU = re.compile(
+    r"\bполный\s+фильм\b|\bпревью\s+фильма\b", re.IGNORECASE)
+_TRAILER_TAIL_RE_RU = re.compile(
+    r"\bтрейлер\b|\bтизер\b|\bполный\s+фильм\b|\bпревью\s+фильма\b",
+    re.IGNORECASE)
+
+
+def _is_trailer_or_studio(cand: dict) -> bool:
+    """(2026-11-14, F1 incident A) True for a candidate that is movie
+    marketing, not music: a film-studio channel, or trailer titling in the
+    title — whole-title multi-word phrases anywhere, single trailer words
+    only in the pipe tail (the left part stays free for band/song names
+    like «Trailer Choirs»)."""
+    if _STUDIO_CHANNEL_RE.search(cand.get("channel") or ""):
+        return True
+    title = cand.get("title") or ""
+    if _TRAILER_TITLE_RE.search(title) or _TRAILER_TITLE_RE_RU.search(title):
+        return True
+    if "|" in title:
+        tail = title.split("|", 1)[1]
+        return bool(_TRAILER_TAIL_RE.search(tail)
+                    or _TRAILER_TAIL_RE_RU.search(tail))
+    return False
+
+
 def _filter_candidates(raw: list, target_n: int = 20, wanted: set[str] | None = None) -> list:
     # duration: unknown (0) or 60-900s
     kept = [c for c in raw if not c.get("duration") or 60 <= c["duration"] <= 900]
+    # trailer/studio gate (2026-11-14, F1 incident A): runs before every
+    # other gate — a movie trailer or a studio-channel upload is not a
+    # music candidate at all (the user of the incident downloaded the
+    # trailer video file instead of the song).
+    trailers = [c for c in kept if not _is_trailer_or_studio(c)]
+    if len(trailers) != len(kept):
+        _log.info("trailer guard: dropped %d movie-trailer/studio candidate(s)",
+                  len(kept) - len(trailers))
+    kept = trailers
     # non-music title gate (runs BEFORE the category-based drop: the category
     # only arrives with the top-5 enrich, a title is always there). The bot
     # delivers tracks — a fails-compilation, an interview or a podcast is
@@ -1037,14 +1161,44 @@ def _filter_candidates(raw: list, target_n: int = 20, wanted: set[str] | None = 
 
 
 def _format_for_rank(description: str, signals: dict, candidates: list,
-                     sonic: dict | None = None, neighbors: list[str] | None = None) -> str:
+                     sonic: dict | None = None, neighbors: list[str] | None = None,
+                     reference: dict | None = None) -> str:
     """Ranker message. neighbors (optional, similar rank mode): the
     reference's empirical getSimilar neighbor artist names — a candidate
     whose channel IS one of them gets a deterministic "[neighbor?] " marker
     prepended to its title. Data, not an LLM guess: the SIMILAR rank prompt
-    explains the marker; no other intent renders it."""
-    sig = ", ".join(f"{k}={v}" for k, v in signals.items() if v) or "—"
-    lines = [f"Описание: {description}", f"Сигналы: {sig}"]
+    explains the marker; no other intent renders it.
+    reference (optional): when it carries a "source" (the inherited
+    film/game of the dialog, 12.11) it is rendered as its own «Источник:»
+    line — the ranker always SEES the movie the query is about. The 12.11
+    traces showed the opposite: a fragment answer named no source, the
+    ranker scored 1.0 for soundtracks of OTHER car-heist movies. The same
+    value may arrive via signals["source"] (the extract-side inheritance at
+    the search_candidates choke point — the shared rank tail passes only
+    signals); it is kept OUT of the generic Сигналы join to avoid a double
+    render.
+    (2026-11-14, artist-only scenario) signals["scope_artist"] renders the
+    «Исполнитель-запрос:» line next to «Источник:» — the whole query is
+    songs of ONE artist — and flags every candidate that does not match the
+    scope with a trailing [чужой?] marker (deterministic _scope_match data,
+    explained inline; the choke-point demotion guarantees the order even
+    when the ranker ignores the marker)."""
+    src = ((reference or {}).get("source") or "").strip() \
+        or (signals.get("source") or "").strip()
+    # (2026-11-14, artist-only) same transport as "source": mirrored into
+    # signals by search_candidates, rendered as its own line, kept out of
+    # the generic Сигналы join.
+    scope = (signals.get("scope_artist") or "").strip()
+    sig = ", ".join(f"{k}={v}" for k, v in signals.items()
+                    if v and k not in ("source", "scope_artist")) or "—"
+    lines = [f"Описание: {description}"]
+    if src:
+        lines.append(f"Источник: {src} (искомый трек должен быть из него)")
+    if scope:
+        lines.append(f"Исполнитель-запрос: {scope} "
+                     f"(все кандидаты должны быть его песнями, РАЗНЫЕ песни; "
+                     f"метка [чужой?] = не этот исполнитель)")
+    lines.append(f"Сигналы: {sig}")
     if sonic and any(sonic.values()):
         sn = ", ".join(f"{k}={v}" for k, v in sonic.items() if v)
         lines.append(f"Звучание (sonic): {sn}")
@@ -1058,9 +1212,12 @@ def _format_for_rank(description: str, signals: dict, candidates: list,
         # it too (honest metadata, no rule attached).
         film = " cat=film" if _is_film_category(c.get("categories")) else ""
         nb = "[neighbor?] " if _channel_key(c.get("channel") or "") in nb_keys else ""
+        # (2026-11-14, artist-only) scope non-match flag: cover/reaction
+        # uploads of OTHER artists that the discovery pulled in.
+        alien = " [чужой?]" if scope and not _scope_match(c, scope) else ""
         line = (
             f"{i}. video_id={c['video_id']} | {nb}{c['title']} | {c['channel']} | "
-            f"dur={c['duration']}s | views={c['views']}{film}{noise}"
+            f"dur={c['duration']}s | views={c['views']}{film}{noise}{alien}"
         )
         # enriched metadata, when present
         if c.get("canonical_artist"):
@@ -1163,10 +1320,14 @@ _RESTART_DETAILS_QUESTION = (
 
 # ---------- deterministic pre-LLM gate ----------
 # Input that should never hit the LLM/ytsearch is caught before the first
-# network call: book/dump (>2000 chars), code/SQL/injection, a bare artist
-# with no track. The reasons moved from the prompt into code: the ranker
-# never sees the target field, and YouTube dislikes garbage queries
-# (HTTP 414).
+# network call: book/dump (>2000 chars), code/SQL/injection. The reasons
+# moved from the prompt into code: the ranker never sees the target field,
+# and YouTube dislikes garbage queries (HTTP 414).
+# (2026-11-14, artist-only scenario) The former bare-artist clarify branch
+# is GONE: a bare artist name ("Depeche Mode") is a legitimate search — the
+# user wants that artist's songs, and LLM#1 now maps it to intent=this_track
+# + target.artist (see the artist-only rule in SYSTEM_EXTRACT) instead of
+# the gate refusing to search.
 
 def _looks_like_code(desc: str) -> bool:
     """SQL/code/injection, not a music query."""
@@ -1186,42 +1347,17 @@ def _looks_like_code(desc: str) -> bool:
     return False
 
 
-def _looks_artist_only(desc: str) -> bool:
-    """A bare artist with no track: 1-3 tokens, each a proper noun
-    (Capitalized or ALL-CAPS), with no track markers. "Хочу рок" (a
-    description) and "test" (lowercase) don't land here: that's not a name
-    but an ordinary query. Track markers (their presence rules out
-    artist-only): feat/ft, parentheses, year/digits, an artist-track dash,
-    quotes."""
-    words = desc.split()
-    if not (1 <= len(words) <= 3):
-        return False
-    words_lower = [w.strip(".,;:!?") for w in words]
-    if any(w in {"ft", "ft.", "feat", "feat.", "featuring"} for w in words_lower):
-        return False
-    if any(ch in desc for ch in "()[]0123456789-–—\"'«»"):
-        return False
-    # every meaningful token is a proper noun (stopword prepositions aside).
-    # "Хочу рок" -> "рок" is not a name -> False; "Michael Jackson" -> both are -> True.
-    stop = {"of", "the", "a", "an", "in", "and", "with"}
-    for w in words_lower:
-        if w in stop or not w:
-            continue  # not w: a pure-punctuation token ("!!!") — not a name; avoids a crash on w[0]
-        if not (w[0].isupper() or w.isupper()):
-            return False
-    return True
-
-
 def _pre_search_gate(description: str) -> tuple[bool, str]:
-    """Deterministic pre-LLM gate. Returns (need_clarify, question)."""
+    """Deterministic pre-LLM gate. Returns (need_clarify, question).
+
+    (2026-11-14, artist-only scenario) No bare-artist branch anymore: a bare
+    artist name flows into the regular LLM#1 pipeline (artist-only scope),
+    instead of the old deterministic clarify that refused to search."""
     d = (description or "").strip()
     if len(d) > 2000:  # book/dump
         return True, "Слишком длинный запрос. Опиши, что ищешь, в паре предложений."
     if _looks_like_code(d):  # SQL/code/injection
         return True, "Похоже, это не музыкальный запрос. Напиши, что за трек ищешь."
-    if _looks_artist_only(d):  # bare artist
-        return True, (f"Ты назвал только «{d}», похоже на исполнителя без трека. "
-                      f"Назови конкретный трек или опиши музыку.")
     return False, ""
 
 
@@ -1702,7 +1838,8 @@ async def rerank_pool(description: str, bothub: BothubClient, pool: list,
                  "duration": c.duration, "views": c.views, "is_noise": c.is_noise}
                 for c in cands[:_RANK_INPUT_N]]
     rank = await bothub.chat_json(rank_prompt_for(intent),
-                                  _format_for_rank(description, {}, as_dicts),
+                                  _format_for_rank(description, {}, as_dicts,
+                                                   reference=reference),
                                   max_tokens=1200, trace=trace, gen_name="llm-rerank",
                                   model=pipeline_model(intent))
     if not rank:
@@ -1769,6 +1906,42 @@ async def _fallback_raw_search(description: str, on_progress, t_start: float, tr
                      confidence="low", intro="", trace=trace, degraded=True)
 
 
+def _is_official_upload(cand: "Candidate") -> bool:
+    """(2026-11-14, F1 incident B) Official-upload evidence for one ranked
+    candidate: a YouTube Music ' - Topic' channel, a VEVO channel, an
+    'Official' marker in the title, or the channel naming the record's
+    canonical artist (the enrich layer's canonical_artist — present only
+    on candidates that were enriched with a resolved artist; plumbed onto
+    the Candidate in pipelines/legacy for the top-5). Fan evidence is
+    everything else — a character-name upload
+    («Sonny Hayes - Lose My Mind» by F4STR) looks perfectly musical to a
+    ranker that does not know the film."""
+    ch = (cand.channel or "").strip()
+    if ch.endswith(" - Topic") or "vevo" in ch.lower():
+        return True
+    if re.search(r"\bofficial\b", cand.title or "", re.IGNORECASE):
+        return True
+    ca = (getattr(cand, "canonical_artist", "") or "").strip()
+    return bool(ca and ch and _ref_key(ca) == _ref_key(ch))
+
+
+# The YouTube OST convention «(From <film>)» is NOT junk to clean_title, so
+# it survives _title_tokens and splits ONE record into two token sets (F1
+# incident B: «Sonny Hayes - Lose My Mind» vs «Lose My Mind (feat. Doja
+# Cat) (From F1® The Movie)» — same song, disjoint token sets). The
+# official-first grouping below strips the source bracket first.
+_OST_BRACKET_RE = re.compile(
+    r"[\(\[][^\)\]]*\b(?:from|из|soundtrack|саундтрек|ost)\b[^\)\]]*[\)\]]",
+    re.IGNORECASE)
+
+
+def _group_title_tokens(title: str) -> frozenset:
+    """_title_tokens minus the OST source bracket(s) — the record identity
+    the official-first guard groups by (same comparator as everywhere
+    else, applied to the de-decorated title)."""
+    return _title_tokens(_OST_BRACKET_RE.sub(" ", title or ""))
+
+
 async def search_candidates(
     description: str,
     bothub: BothubClient,
@@ -1782,6 +1955,7 @@ async def search_candidates(
     trace=None,  # tracing.SearchTrace: trace of this search; None = no tracing
     user_id: int | None = None,  # asking user; personal-taste layers (surprise)
     store=None,  # services.store module (or stub); personal-history reads (surprise)
+    source_anchor: str | None = None,  # inherited source (film/game) of the dialog's last from_source reference
 ) -> SearchOut:
     """description -> SearchOut. context is recent queries (recent_context).
     excluded_ids are video_ids the user already rejected in the refinement
@@ -1801,6 +1975,15 @@ async def search_candidates(
     are the defaults and reproduce the previous behavior exactly; the
     bot/handler.py call-site wiring (passing the rejected titles and the
     streak) is added separately — handler.py belongs to another fix.
+    source_anchor (clarification memory, 12.11): the LAST from_source
+    reference of the user's recent dialog (e.g. "мадагаскар 2"), supplied
+    by the handler. A fragment answer («нет, ее включали, когда угнали
+    машину») names no source of its own; without the anchor each fragment
+    started a FRESH source-less search. It reaches LLM#1 as a separate
+    «КОНТЕКСТ ИСТОЧНИКА» block and, deterministically, the extract's empty
+    reference source (from_source / this_track) — see the inheritance block
+    below. None (default) reproduces the previous behavior byte-for-byte;
+    the handler wiring is another fix's file.
     metadata_svc powers the second metadata pass over the top-5 candidates:
     yt-dlp extract_info + Last.fm; None (or no key) → extract_info only.
     on_progress(stage, text) is an async callback for streaming status.
@@ -1845,6 +2028,15 @@ async def search_candidates(
     ctx_block = _format_context_block(context or []) if _is_referential(description) else ""
     if ctx_block:
         user_msg = ctx_block + "\n\nТекущий запрос:\n" + description
+    # Source anchor (clarification memory, 12.11): a separate prefixed block,
+    # never glued into the user's words. The gates above ran on `description`
+    # only, so the added block cannot trip them; conversely the anchor itself
+    # is scrubbed with the injection detector — it derives from a past user
+    # text and must not smuggle instructions into this prompt.
+    anchor = (source_anchor or "").strip()
+    if anchor and not _INJECTION_RE.search(_fold_injection(anchor)):
+        user_msg = (f"КОНТЕКСТ ИСТОЧНИКА (из предыдущих запросов диалога): {anchor}"
+                    "\n\n" + user_msg)
     # The extract call necessarily runs on the client's global model: the
     # intent does not exist until THIS call answers it. The per-pipeline
     # models (LLM_MODEL_PIPELINES via pipeline_model) apply from the
@@ -1869,6 +2061,66 @@ async def search_candidates(
     reference = extract.get("reference") or {}
     target = extract.get("target") or {}
     intro = (extract.get("intro") or "").strip()
+
+    # --- source anchor inheritance (12.11, the deterministic "always" layer:
+    # persuasion in the SYSTEM_EXTRACT rule, guarantee in the code). When the
+    # dialog's from_source reference is known and the extract left the
+    # reference source empty, populate it from the anchor: sonar, the ranker
+    # and YouTube then see the movie even if LLM#1 ignored the КОНТЕКСТ
+    # ИСТОЧНИКА block. Never overrides the extract's OWN source; only
+    # from_source/this_track inherit (similar's reference is a sound
+    # reference, mood must not borrow one — КОНТЕКСТ НЕ СОЗДАЁТ РЕФЕРЕНС).
+    # The source also mirrors into signals: that is the transport the rank
+    # input reads (_rank_and_decide passes only signals; _format_for_rank
+    # renders the «Источник:» line from it).
+    if isinstance(reference, dict):
+        from services.pipelines import _normalize_intent
+        ref_src = (reference.get("source") or "").strip()
+        if (not ref_src and anchor
+                and _normalize_intent(intent) in ("from_source", "this_track")):
+            reference["source"] = ref_src = anchor
+            _log.info("source anchor inherited: %r", anchor)
+        if ref_src:
+            signals["source"] = ref_src
+            extract["signals"] = signals
+
+    # --- artist-only scope detection (2026-11-14, incident 14.11: «depeche
+    # mode» must return ONLY that artist's songs, and a «Не то» must give
+    # ANOTHER song by the SAME artist). LLM#1 contract (the artist-only rule
+    # in SYSTEM_EXTRACT): a bare artist name extracts as intent=this_track +
+    # target.artist with target.track empty. The scope artist then
+    #   - drives the pool guarantee in the choke point below (demotion/drop
+    #     of non-matching candidates),
+    #   - reaches the ranker as the «Исполнитель-запрос:» line (mirrored
+    #     into signals — the same transport the source anchor uses, read by
+    #     _format_for_rank),
+    #   - is reported to the handler via SearchOut.scope_artist.
+    # Detected from the TARGET (not the raw text): the deterministic gate
+    # can no longer see artist-only queries — «U2»/«P!nk» never looked like
+    # a name to it anyway — while LLM#1 reliably extracts the target.
+    scope_artist = ""
+    if (isinstance(target, dict)
+            and (target.get("artist") or "").strip()
+            and not (target.get("track") or "").strip()):
+        from services.pipelines import _normalize_intent as _norm_intent
+        if _norm_intent(intent) == "this_track":
+            scope_artist = (target["artist"] or "").strip()
+            signals["scope_artist"] = scope_artist
+            extract["signals"] = signals
+            # (2026-11-14, web port) The target artist can never be banned
+            # by its OWN search: the web frontend passes the rejected cards'
+            # artists back verbatim, and in artist-only mode every card's
+            # artist IS the target band — the bot handler already filters
+            # its copy; the core now guarantees this for EVERY caller
+            # (idempotent where both apply). _ref_key mirrors the
+            # normalization the filter compares against (legacy.py).
+            if scope_artist and excluded_artists:
+                _scope_key = _ref_key(scope_artist.removesuffix(" - Topic"))
+                _guarded = {a for a in excluded_artists if a and a != _scope_key}
+                if len(_guarded) != len(excluded_artists):
+                    _log.info("artist scope: target artist kept out of the "
+                              "channel ban")
+                    excluded_artists = _guarded or None
 
     # Destructive-content verdict from the LLM — before any YouTube requests.
     # Literal null-words ("null"/"none"/...) mean no category (sec2): normalize
@@ -1962,6 +2214,9 @@ async def search_candidates(
     out = await route(intent).run(ctx)
     if out is not None:
         norm_intent = _normalize_intent(intent)
+        # (2026-11-14, artist-only scenario) report the scope to the handler
+        # whatever the guards below do to the pool.
+        out.scope_artist = scope_artist
         if (not out.candidates and not out.need_clarify
                 and not out.block and not out.degraded):
             # f3: the pipeline found nothing and asked nothing — the user got
@@ -2021,6 +2276,174 @@ async def search_candidates(
                 else:
                     out.best_index = -1
                 out.candidates = kept
+
+        # --- artist-scope pool guarantee (2026-11-14, incident 14.11,
+        # artist-only scenario) ---
+        # With a scope artist active (a bare-artist query), the pool must
+        # deliver THAT artist's songs — the incident user typed a band name
+        # and got covers/reaction uploads by other artists mixed in (and a
+        # «Не то» then drifted to a different band entirely). Deterministic
+        # scheme over the FINAL ranked pool, AFTER LLM#2 (the ranker sees
+        # the «Исполнитель-запрос:» note and the [чужой?] markers; this
+        # guard is the guarantee when it ignores them):
+        #   match = _scope_match (channel minus " - Topic" == scope key, OR
+        #           the enriched canonical artist == scope key, OR the
+        #           artist name in the title as whole words);
+        #   - >= _SCOPE_MATCH_DROP matches: non-matches are DROPPED — the
+        #     pool has enough of the artist's own songs, a cover by another
+        #     band never reaches the user;
+        #   - 1..4 matches: DEMOTION, not a drop — every non-match score is
+        #     clamped to (weakest match score - _SCOPE_DEMOTE_GAP), then a
+        #     stable re-sort by score: NO non-match can outrank ANY match
+        #     (the best position a non-match can take is below the whole
+        #     match block, 0.05 under its weakest member), while a thin pool
+        #     keeps its fillers visible for download fallback;
+        #   - 0 matches: no anchor to demote against — the pool stands.
+        # best_index follows its video_id through the reorder; when the
+        # LLM's best was itself a non-match (dropped or demoted), the slot
+        # moves to the top match.
+        if scope_artist and out.candidates:
+            _sc_match_ids = {c.video_id for c in out.candidates
+                             if _scope_match(c, scope_artist)}
+            _log.info("artist scope: %d/%d candidates match %r",
+                      len(_sc_match_ids), len(out.candidates), scope_artist)
+            if _sc_match_ids:
+                # The best stays only when it IS a match; a non-match best
+                # (the incident: a cover the LLM loved) hands its slot to
+                # the top match below.
+                _sc_best_vid = (out.candidates[out.best_index].video_id
+                                if (0 <= out.best_index < len(out.candidates)
+                                    and out.candidates[out.best_index].video_id
+                                    in _sc_match_ids) else "")
+                _sc_pool = len(out.candidates)
+                if len(_sc_match_ids) >= _SCOPE_MATCH_DROP:
+                    out.candidates = [c for c in out.candidates
+                                      if c.video_id in _sc_match_ids]
+                    _log.info("artist scope: dropped %d non-match(es), %d left",
+                              _sc_pool - len(out.candidates), len(out.candidates))
+                else:
+                    _sc_floor = round(min(c.score for c in out.candidates
+                                          if c.video_id in _sc_match_ids)
+                                      - _SCOPE_DEMOTE_GAP, 4)
+                    _sc_demoted = sum(
+                        1 for c in out.candidates
+                        if c.video_id not in _sc_match_ids and c.score > _sc_floor)
+                    if _sc_demoted:
+                        for c in out.candidates:
+                            if c.video_id not in _sc_match_ids and c.score > _sc_floor:
+                                c.score = _sc_floor
+                        # stable re-sort: matches (all > floor) lead, ties
+                        # keep the ranker's relative order
+                        out.candidates.sort(key=lambda c: -c.score)
+                        _log.info("artist scope: demoted %d non-match(es) "
+                                  "below the matches", _sc_demoted)
+                # re-point best: same video when it survived, else the top
+                # of the list (a match by construction: every match outranks
+                # every non-match after the reorder/drop)
+                _sc_i = next((k for k, c in enumerate(out.candidates)
+                              if c.video_id == _sc_best_vid), None)
+                out.best_index = _sc_i if _sc_i is not None else 0
+
+        # --- official-first guard (2026-11-14, F1 incident B) ---
+        # Prod incident: the ranker put the fan cut «Sonny Hayes - Lose My
+        # Mind» (channel F4STR — the film CHARACTER as the "artist") at
+        # 0.9 over the official «Lose My Mind (feat. Doja Cat) (From F1®
+        # The Movie)» at 0.5 in the SAME pool: the model has no way to
+        # know «Sonny Hayes» is not a performer. When one RECORD group
+        # (_same_record over _group_title_tokens — the diversity guard's
+        # identity, minus the OST source bracket) holds BOTH an official
+        # upload and a fan copy scored
+        # ABOVE it, the fan score is clamped to (best official - 0.05),
+        # the list re-sorts and best_index follows the demoted pick's
+        # record. No official in the group, or no fan above it — nothing
+        # changes (the guard is a no-op for official-only and fan-only
+        # pools).
+        if len(out.candidates) > 1:
+            _of_best_vid = (out.candidates[out.best_index].video_id
+                            if 0 <= out.best_index < len(out.candidates) else "")
+            _of_groups: list[list[frozenset]] = []   # token sets per group
+            _of_members: list[list] = []             # candidates per group
+            for c in out.candidates:
+                toks = _group_title_tokens(c.title)
+                gi = next((i for i, g in enumerate(_of_groups)
+                           if any(_same_record(toks, t) for t in g)), None)
+                if gi is None:
+                    _of_groups.append([toks])
+                    _of_members.append([c])
+                else:
+                    _of_groups[gi].append(toks)
+                    _of_members[gi].append(c)
+            _of_demoted: set[int] = set()
+            for members in _of_members:
+                if len(members) < 2:
+                    continue
+                off = [c for c in members if _is_official_upload(c)]
+                off_ids = {id(c) for c in off}
+                fans = [c for c in members if id(c) not in off_ids]
+                if not off or not fans:
+                    continue
+                off_top = max(c.score for c in off)
+                for c in fans:
+                    if c.score > off_top:
+                        c.score = round(off_top - 0.05, 4)
+                        _of_demoted.add(id(c))
+            if _of_demoted:
+                _log.info("official-first guard: demoted %d fan copie(s) "
+                          "below their official upload", len(_of_demoted))
+                # stable re-sort by score: ties keep the current order
+                out.candidates.sort(key=lambda c: -c.score)
+                if _of_best_vid:
+                    i = next((k for k, c in enumerate(out.candidates)
+                              if c.video_id == _of_best_vid), None)
+                    if i is not None:
+                        if id(out.candidates[i]) in _of_demoted:
+                            # the former best WAS a demoted fan — hand its
+                            # slot to the record's new leader (the official)
+                            bt = _group_title_tokens(out.candidates[i].title)
+                            i = next((k for k, c in enumerate(out.candidates)
+                                      if _same_record(
+                                          _group_title_tokens(c.title), bt)), i)
+                        out.best_index = i
+
+        # --- circular-clarify sanitizer (13.11, incident: F1 search asked
+        # «Уточните исполнителя или название» on a from_source hunt). A user
+        # searching music FROM a film/game/ad by definition does not know
+        # the artist/title - the ranker's clarify must ask about the SCENE.
+        # The prompt rule persuades; this guard guarantees.
+        # (2026-11-14, F1 incident C) the sanitized ask now varies with
+        # restart_streak: the incident burned the user with the SAME
+        # «В какой момент звучала музыка?» three times in a row. Streak 0
+        # keeps the original scene question; from restart #1 the ask
+        # escalates — the scene IN DETAIL plus a lyrics crumb.
+        if out.need_clarify and out.clarify_question:
+            _cq = out.clarify_question
+            _asks_name = re.search(
+                r"исполнител|названи|артист|\bartist\b|\btitle\b", _cq, re.I)
+            _asks_scene = re.search(
+                r"сцен|момент|эпизод|происходил|источник|фильм|scene|moment|source|film",
+                _cq, re.I)
+            if _asks_name and not _asks_scene and norm_intent in (
+                    "from_source", "mood"):
+                _en = str((signals or {}).get("language") or "").lower().startswith("en")
+                if restart_streak >= 1:
+                    out.clarify_question = (
+                        "Describe the scene in more detail: what was "
+                        "happening on screen while the music played? If "
+                        "you remember a few words of the lyrics, type them."
+                        if _en else
+                        "Опиши сцену подробнее: что происходило на экране, "
+                        "когда играла музыка? Если помнишь пару слов из "
+                        "песни — напиши их.")
+                else:
+                    out.clarify_question = (
+                        "Which moment was the music in? Describe what was "
+                        "happening on screen, and I will find the track."
+                        if _en else
+                        "В какой момент звучала музыка? Опиши, что происходило "
+                        "на экране, и я найду трек.")
+                _log.info("clarify sanitized: circular artist/title ask "
+                          "replaced with a scene question (intent=%s, "
+                          "streak=%d)", norm_intent, restart_streak)
 
         # --- no-repeat of a fresh delivery (audit 11.11, incident: "удиви"
         # after a film search returned the track the user got 4 minutes

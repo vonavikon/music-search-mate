@@ -61,6 +61,69 @@ _SIM_REUSE_WINDOW = 900  # sec: cached "similar" window (same reference -> next 
 _REUSE_BLOCKERS = ("другое", "другой", "другая", "вообще", "не это", "не этот", "совсем")  # these words mark the refinement as a "new search"
 _REFINE_TTL = 600  # sec: window where text after "Уточнить" counts as a query edit (spec: 10-30 min)
 
+# Clarification memory (audit П1, prod 12.11 «мадагаскар 2»): a from_source
+# search fixes the movie in the user's head, but the answers to the bot's
+# clarify question are fragments («это трек 80х», «ее включали когда угнали
+# машину») with no source in them — each ran as a FRESH search and the results
+# drifted to other movies. The last from_source reference source is remembered
+# per user and supplied to search_candidates (source_anchor) for every NEW user
+# text; the core inherits it only when its own extract leaves the source empty.
+_SOURCE_ANCHOR: dict[int, tuple[str, float]] = {}  # user_id -> (source, ts)
+_SOURCE_ANCHOR_TTL = 15 * 60  # sec: survives a clarify round-trip, not the evening
+_SOURCE_ANCHOR_MAX_USERS = 64  # cap: past it the oldest entry (by ts) is dropped
+
+
+def _remember_source_anchor(user_id: int, out) -> None:
+    """Anchor bookkeeping of a finished search (called from _finish_search).
+
+    from_source + a non-empty reference source/name -> remember it for the
+    user's next texts. Any other intent leaves the store untouched (the TTL is
+    the expiry); a later from_source with a different source simply overwrites."""
+    try:
+        if getattr(out, "intent", None) != "from_source":
+            return
+        ref = getattr(out, "reference", None)
+        source = ((ref.get("source") or ref.get("name") or "")
+                  if isinstance(ref, dict) else "").strip()
+        if not source:
+            return
+        now = time.time()
+        # lazy expiry of stale entries + the cap (oldest by ts goes first)
+        for uid in [u for u, (_, ts) in _SOURCE_ANCHOR.items()
+                    if now - ts > _SOURCE_ANCHOR_TTL]:
+            _SOURCE_ANCHOR.pop(uid, None)
+        _SOURCE_ANCHOR[user_id] = (source, now)
+        while len(_SOURCE_ANCHOR) > _SOURCE_ANCHOR_MAX_USERS:
+            _SOURCE_ANCHOR.pop(min(_SOURCE_ANCHOR, key=lambda u: _SOURCE_ANCHOR[u][1]))
+    except Exception:
+        log.warning("source anchor store failed", exc_info=True)
+
+
+def _anchor_for(user_id: int, desc: str | None) -> str | None:
+    """The remembered source to pass as source_anchor= for a NEW user text, or
+    None. Never raises — a failure to supply an anchor must not break a search.
+
+    None when nothing is stored, the TTL has passed (the entry is dropped
+    lazily), or the desc is a refinement envelope (ORIGINAL_QUERY: ...) that
+    already carries its own reference. Only new-text call sites ask; the sim
+    button and the miss-restart build their own full descs and never call this."""
+    try:
+        entry = _SOURCE_ANCHOR.get(user_id)
+        if not entry:
+            return None
+        source, ts = entry
+        age = time.time() - ts
+        if age > _SOURCE_ANCHOR_TTL:
+            _SOURCE_ANCHOR.pop(user_id, None)
+            return None
+        if desc and "ORIGINAL_QUERY:" in desc:
+            return None
+        log.info("source anchor supplied: %r (age %.0fs)", source, age)
+        return source
+    except Exception:
+        return None
+
+
 # per-chat pipeline serialization: two back-to-back messages in one chat must not
 # run parallel searches (race on chat_data / status / q:{id} / rejected_ids). The
 # second waits for the first. The lock lives in process memory — lost on restart (fine for an MVP).
@@ -609,6 +672,7 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.chat_data.pop("refine", None)
     context.chat_data["ctx_after"] = time.time()
+    _SOURCE_ANCHOR.pop(update.effective_user.id, None)  # clarification memory (П1) dies with the context
     await update.message.reply_text(await _t(update.effective_user.id, "new_reset"))
 
 
@@ -1048,7 +1112,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # "Понимаю запрос…" and the intro (a duplicated start from the ux-review) —
         # the user couldn't catch it.
         status = await update.message.reply_text(await _status_text(update.effective_user.id))
-        out = await _do_search(update, context, status, desc)
+        # clarification memory (П1): a fragment answering a clarify question keeps
+        # the movie anchor of the last from_source search (None = nothing fresh;
+        # _anchor_for never raises, so the anchor can't break the search)
+        out = await _do_search(update, context, status, desc,
+                               source_anchor=_anchor_for(user.id, desc))
         if out is None:
             return
         await _finish_search(update, context, status, out, desc, user)
@@ -1165,7 +1233,7 @@ async def _maybe_wtp(update, context, user, trigger: str, feature: str, usage_n:
 
 async def _do_search(update, context, status, desc, excluded_ids=None,
                      excluded_artists=None, excluded_titles=None,
-                     restart_streak=0):
+                     restart_streak=0, source_anchor=None):
     """Streaming status + search_candidates. Returns SearchOut or None (error already shown).
 
     excluded_ids — rejected video_ids (refinement), passed to search_candidates for
@@ -1174,6 +1242,9 @@ async def _do_search(update, context, status, desc, excluded_ids=None,
     excluded_titles — raw titles of rejected tracks: the same song from ANY other
     upload/channel is dropped, and restart echo-queries naming them die too.
     restart_streak — miss count driving the neighbor-window rotation on restart.
+    source_anchor — clarification memory (П1): the remembered from_source source,
+    supplied ONLY by new-text callers (the message path and the broken-URL text
+    fallback); the core inherits it when its extract leaves the source empty.
     Shared path for new searches and refinements."""
     bothub = context.bot_data["bothub"]
     _t_search0 = time.monotonic()  # query latency for the queries table
@@ -1293,17 +1364,24 @@ async def _do_search(update, context, status, desc, excluded_ids=None,
     trace = SearchTrace(uuid4().hex, update.effective_user.id,
                         update.effective_chat.id if update.effective_chat else None, desc,
                         name=(desc or "")[:60] or "search")
+    # clarification memory (П1): source_anchor is forwarded only when set, so the
+    # no-anchor call shape stays exactly the pre-П1 one
+    _sc_kwargs = dict(
+        context=ctx_history,
+        excluded_ids=excluded_ids,
+        excluded_artists=excluded_artists,
+        excluded_titles=excluded_titles,
+        restart_streak=restart_streak,
+        on_progress=on_progress,
+        metadata_svc=context.bot_data.get("metadata"),
+        trace=trace,
+        user_id=update.effective_user.id,
+        store=store_svc,
+    )
+    if source_anchor:
+        _sc_kwargs["source_anchor"] = source_anchor
     try:
-        out = await search_candidates(desc, bothub, context=ctx_history,
-                                      excluded_ids=excluded_ids,
-                                      excluded_artists=excluded_artists,
-                                      excluded_titles=excluded_titles,
-                                      restart_streak=restart_streak,
-                                      on_progress=on_progress,
-                                      metadata_svc=context.bot_data.get("metadata"),
-                                      trace=trace,
-                                      user_id=update.effective_user.id,
-                                      store=store_svc)
+        out = await search_candidates(desc, bothub, **_sc_kwargs)
     except Exception:
         prog["alive"] = False
         pulse.cancel()
@@ -1376,7 +1454,14 @@ async def _finish_search(update, context, status, out, desc, user):
     # Even past the auto-download threshold, an ambiguous choice (a close second
     # candidate or low confidence) shows the top-3 instead of downloading one version.
     ambiguous = is_ambiguous(out.candidates, out.best_index, out.confidence)
-    auto = bool(best) and should_auto_download(out.intent, best.match_score) and not ambiguous
+    # (2026-11-14) Artist-only scope (prod 14.11: "ввожу просто название группы —
+    # хочу только её песни"): a bare band name means the songs of THIS band, and
+    # no single track is a safe guess — never auto-download in that mode; the
+    # user picks the song from the preview (see the branch below the degraded
+    # one). getattr: scope_artist is core-owned and may be absent.
+    _artist_only = bool(getattr(out, "scope_artist", ""))
+    auto = (bool(best) and should_auto_download(out.intent, best.match_score)
+            and not ambiguous and not _artist_only)
 
     # Persist match_score and the auto/preview decision to queries so Store logs can
     # measure hit-rate per threshold (which match_score actually earns a "То").
@@ -1411,10 +1496,21 @@ async def _finish_search(update, context, status, out, desc, user):
         "desc": desc, "rejected_ids": [],
         # for the "Похожее" cache (same reference) and refinement reranking
         "intent": out.intent, "reference": out.reference, "ts": time.time(),
+        # (2026-11-14) target artist/track of the search (artist-only scope, prod
+        # 14.11): survives into the callback state so the "Не то" restart can
+        # keep the target artist out of the channel ban (see the fb-miss path).
+        # getattr: the field is core-owned; a None never reaches JSON.
+        "target": getattr(out, "target", None) or {},
     })
     context.chat_data["last_qid"] = query_id
     # usage accounting (LLM search)
     await incr_usage(user.id, "searches")
+
+    # Clarification memory (П1, prod 12.11): a completed from_source search fixes
+    # the source for this user's follow-up texts — fragments answering a clarify
+    # question inherit it (via _anchor_for) instead of drifting to other movies.
+    # A later from_source overwrites; other intents leave the store to the TTL.
+    _remember_source_anchor(user.id, out)
 
     # branch 1: the model asks for a clarification (query too vague)
     if out.need_clarify and out.clarify_question:
@@ -1442,7 +1538,21 @@ async def _finish_search(update, context, status, out, desc, user):
                                            lang=await _lang_of(user.id))
             await status.edit_text(text, reply_markup=markup)
         else:
-            await status.edit_text(await _t(user.id, "nothing_found"))
+            await status.edit_text(await _t(update.effective_user.id, "nothing_found"))
+        return
+    # (2026-11-14) Artist-only scope: the preview IS the answer here — the user
+    # named a band and picks the song from its list (the existing pk: pick
+    # buttons + the saved state drive the download). Guarded on _artist_only
+    # alone: every other path keeps the 2026-11-01 single+download decision.
+    # Reuses _render_preview with the core's out.intro as the head line — no
+    # new locale strings.
+    if _artist_only and best:
+        text, markup = _render_preview(query_id, out.candidates, out.verdict,
+                                       out.intro, lang=await _lang_of(user.id))
+        await status.edit_text(text, reply_markup=markup)
+        if trace:
+            trace.finish(output={"decision": "artist_scope_preview",
+                                 "best": best.title})
         return
     # Owner decision 2026-11-01: ONE result delivered immediately with the track
     # downloaded; the send is always "card (cover + facts) -> tagged audio".
@@ -1658,7 +1768,9 @@ async def _handle_url(update, context, media, user, url, desc):
             await status.edit_text(await _t(update.effective_user.id, "link_read_hint"))
             return
         await status.edit_text(await _t(update.effective_user.id, "link_read_desc"))
-        out = await _do_search(update, context, status, rest)
+        # the words around a broken link are a NEW user text -> the anchor applies (П1)
+        out = await _do_search(update, context, status, rest,
+                               source_anchor=_anchor_for(user.id, rest))
         if out is not None:
             await _finish_search(update, context, status, out, rest, user)
         return
@@ -3369,6 +3481,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rej_artists = {_ref_key((c.channel or "").removesuffix(" - Topic"))
                            for c in candidates
                            if c.video_id in (store.get("rejected_ids") or [])}
+            # (2026-11-14) Target-artist protection (prod 14.11: "ввожу просто
+            # название группы — хочу только её песни"). In artist-only mode all
+            # candidates may sit on the TARGET artist's own channel ("Depeche
+            # Mode - Topic"), so 2-3 "Не то" presses would ban the very band the
+            # user asked for and the pool would flip to covers and foreign
+            # artists. Keep the target artist out of the channel ban: the target
+            # comes from the saved search state ("target"; legacy states may
+            # only carry "scope_artist"; neither -> no protection, old
+            # behavior). Comparison is _ref_key-vs-_ref_key, like the set above.
+            # Rejected foreign channels stay banned.
+            _tgt_artist = (((store.get("target") or {}).get("artist"))
+                           or (store.get("scope_artist") or ""))
+            _tgt_key = _ref_key(_tgt_artist) if _tgt_artist else ""
+            excluded_artists = {a for a in rej_artists if a and a != _tgt_key}
             base_desc = store.get("desc", "")
             if store.get("intent") == "direct_url":
                 sp_a, sp_t = _split_yt_reference(
@@ -3381,7 +3507,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = await q.message.reply_text(await _status_text(update.effective_user.id, "st_other"))
             out = await _do_search(update, context, status, desc2,
                                    excluded_ids=set(store.get("rejected_ids") or []),
-                                   excluded_artists={a for a in rej_artists if a},
+                                   excluded_artists=excluded_artists,
                                    excluded_titles=set(rej_titles),
                                    restart_streak=streak)
             if out is not None and out.candidates:

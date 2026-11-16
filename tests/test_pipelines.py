@@ -303,8 +303,8 @@ def test_searchout_field_set_frozen():
     frozen = sorted([
         "intent", "signals", "queries", "assoc", "candidates", "best_index",
         "confidence", "intro", "verdict", "need_clarify", "clarify_question",
-        "reference", "target", "block", "degraded", "trace",
-    ])
+        "reference", "target", "scope_artist", "block", "degraded", "trace",
+    ])  # scope_artist added 2026-11-14 (artist-only mode, incident 14.11)
     assert sorted(f.name for f in dataclasses.fields(SearchOut)) == frozen
 
 

@@ -276,6 +276,12 @@ async def _rank_and_decide(ctx: PipelineContext, f: _Fields, queries: list,
                                   model=pipeline_model(rank_int))
     emit_stage("llm2_rank", time.perf_counter() - _t0)
     t_rank = time.perf_counter() - t_start
+    # (2026-11-14, F1 incident B) canonical artists of the enriched top-5
+    # ride onto the Candidates below: the official-first guard (llm_search)
+    # reads them as official-upload evidence. `filtered` itself never
+    # carries canonical fields — only the enriched top-5 copies do.
+    _canon_art = {c.get("video_id"): str(c.get("canonical_artist") or "")
+                  for c in (enriched or [])[:5] if isinstance(c, dict)}
     if not rank:
         # No rank — return the filtered ones unscored, best=0
         cands = [Candidate(
@@ -283,6 +289,7 @@ async def _rank_and_decide(ctx: PipelineContext, f: _Fields, queries: list,
             source=c.get("source", "youtube"),
             url=c.get("url") or f"https://www.youtube.com/watch?v={c['video_id']}",
             fallback_url=c.get("fallback_url", ""),
+            canonical_artist=_canon_art.get(c["video_id"], ""),
         ) for c in filtered]
         _log.info("search latency extract=%.2fs search=%.2fs filter=%.2fs rank=%.2fs (no rank)",
                   t_extract, t_search, t_filter, t_rank)
@@ -306,6 +313,7 @@ async def _rank_and_decide(ctx: PipelineContext, f: _Fields, queries: list,
             fallback_url=c.get("fallback_url", ""),
             canonical_year=str(c.get("canonical_year") or ""),
             canonical_album=str(c.get("canonical_album") or ""),
+            canonical_artist=_canon_art.get(c["video_id"], ""),
         ))
     ranked.sort(key=lambda c: c.score, reverse=True)
 
