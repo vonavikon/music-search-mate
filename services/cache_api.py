@@ -915,4 +915,8 @@ if __name__ == "__main__":
     log.info("msm-cache starting: host=%s port=%d db=%s art=%s",
              host, port, application.state.store.db_path,
              application.state.store.art_dir)
-    uvicorn.run(application, host=host, port=port, log_level="info")
+    # (2026-11-17) access_log off: uvicorn prints full request URLs
+    # (artist=/track= keys) - the service's own op=/outcome= counters are
+    # the sanctioned log surface, query-derived data stays out of logs
+    uvicorn.run(application, host=host, port=port, log_level="info",
+                access_log=False)

@@ -217,21 +217,26 @@ async def test_official_first_topic_channel_end_to_end(bothub_client):
 
 
 async def test_official_first_fan_only_pool_unchanged(bothub_client):
-    """No official upload in the record group -> the guard is a no-op."""
+    """No official upload in the RECORD GROUP -> the guard is a no-op.
+    (2026-11-16) an official of ANOTHER record rides along: the
+    officials-only delivery gate (from_source) needs one official in the
+    pool to let the fan-only group stand - exactly this no-op case."""
     entries = [
         _c("fan1", "Sonny Hayes - Lose My Mind", "F4STR", 230, 900000),
         _c("fan2", "Lose My Mind (From F1® The Movie)", "F1 Soundtracks", 210, 5000),
+        _c("off0", "Hans Zimmer - F1 (From F1® The Movie)", "Hans Zimmer - Topic",
+           200, 5_000_000),
     ]
     with patch.object(bothub_client, "chat_json") as mock_chat:
         mock_chat.side_effect = [
             _extract(intent="from_source"),
-            _rank([("fan1", 0.9), ("fan2", 0.7)], best_index=0),
+            _rank([("fan1", 0.9), ("fan2", 0.7), ("off0", 0.1)], best_index=0),
         ]
         with patch("services.llm_search.search_metadata", return_value=entries):
             out = await search_candidates("рок из фильма f1", bothub_client)
 
-    assert [c.video_id for c in out.candidates] == ["fan1", "fan2"]
-    assert [c.score for c in out.candidates] == [0.9, 0.7]
+    assert [c.video_id for c in out.candidates][:2] == ["fan1", "fan2"]
+    assert [c.score for c in out.candidates][:2] == [0.9, 0.7]
     assert out.best_index == 0
 
 

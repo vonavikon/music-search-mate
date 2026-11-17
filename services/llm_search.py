@@ -60,7 +60,7 @@ SYSTEM_EXTRACT = CHAR_PROMPT + """
   "intro": "короткая фраза-справка, ЧТО ищем (жанр, эпоха, регион, источник), без оценок и восклицаний. Напр. 'Ищу: французский рэп, Марсель, 1990-е.'. Пиши intro и clarify_question НА ЯЗЫКЕ запроса пользователя (запрос на английском -> intro на английском).",
   "intent": "this_track | similar | from_source | mood | surprise",
   "signals": {"language": "...|null", "era": "напр. 1980s|null", "vocal": "male|female|instrumental|null", "genre": "...|null", "mood": "...|null"},
-  "target": {"artist": "...|null", "track": "...|null"},
+  "target": {"artist": "...|null", "track": "...|null", "variant": "slowed|sped_up|nightcore|reverb|remix|acoustic|live|instrumental|extended|null"},
   "reference": {"artist": "...|null", "track": "...|null", "source": "источник из запроса (фильм/игра/сериал/реклама, оригинальное написание)|null — только при intent=from_source"},
   "sonic": {"tempo": "...|null", "instrumentation": "...|null", "dynamics": "...|null", "vocal_timbre": "...|null"},
   "association_candidates": [{"artist": "...", "track": "...", "rationale": "почему этот артист звучит похоже на референс"}],
@@ -77,6 +77,7 @@ SYSTEM_EXTRACT = CHAR_PROMPT + """
 - ИСТОЧНИК ПЕРВОГО ПОИСКА (инцидент 14.11 F1): при intent=from_source ВСЕГДА возвращай в reference.source название источника ИЗ САМОГО запроса в оригинальном написании («формула 1»→"F1 The Movie", «мадагаскар»→Madagascar) — по нему работает память уточнений и посев саундтрека. Нет источника в запросе и в контексте — null.
 - target — конкретно искомый трек {artist, track} при intent=this_track (нужен для точного матчинга кандидата). Для similar/from_source/mood — {artist:null,track:null}. Не выдумывай: только если артист и название реально извлекаются из запроса.
 - АРТИСТ БЕЗ ТРЕКА (инцидент 14.11): запрос = ТОЛЬКО имя исполнителя/группы, без трека и без описания звучания («depeche mode», «Кино», «P!nk») -> intent=this_track, target.artist = имя, target.track = null; это запрос песен ЭТОГО исполнителя, НЕ similar и НЕ mood. В queries — РАЗНЫЕ известные треки этого исполнителя (не одна песня с приписками).
+- ВАРИАНТ-МОДИФИКАТОР (решение 16.11): вариант-модификатор (slowed, sped up, nightcore, reverb, remix, acoustic, live, instrumental, extended, 8d) — ЧАСТЬ пожелания пользователя, а не шум: если модификатор назван, верни его в target.variant (каноническое значение из набора; 8d -> nightcore), сохрани модификатор в queries ("the way i are slowed") и НЕ нормализуй запрос к оригиналу; модификатор не назван -> null.
 - reference — артист/трек, ЧЬЁ звучание описано (на что ищем похожее: «как Дурной вкус», «в духе Tame Impala»). artist/track — только при intent=similar, иначе null; source — только при intent=from_source (см. правила источника). Это НЕ кандидат на выдачу. Не возвращай сам референс в результатах.
 - sonic — звуковой отпечаток референса, КАК он звучит, а не в каком жанре: tempo (медленный/средний/быстрый, можно ~bpm), instrumentation (какие инструменты), dynamics (тихо/громко, нарастания), vocal_timbre (тембр вокала: хриплый/чистый/фальцет). Заполняй при intent=similar (отпечаток референса) и при intent=mood (перевод состояния в звук: какой темп, инструменты, динамика и вокал подходят под описание); иначе все null.
 - association_candidates — ПОХОЖИЕ артисты (кандидаты, КОТОРЫЕ хотим выдать), только при intent=similar. Иначе [] (при mood — всегда []).
@@ -283,6 +284,10 @@ class Candidate:
     canonical_year: str = ""     # card fact captions (from enrich top-5)
     canonical_album: str = ""
     canonical_artist: str = ""   # official-first guard evidence (enrich top-5)
+    # (2026-11-17, incident 17.11 В) filled by the confirmed-track card
+    # override from the sonar fact; empty unless the fact search confirmed
+    # the record (the ytdlp garbage name case).
+    canonical_track: str = ""
 
 
 @dataclass
@@ -622,6 +627,113 @@ def _wanted_versions(text: str) -> set[str]:
     """Version classes explicitly requested in the text. Their penalty is not applied."""
     t = (text or "").lower()
     return {key for key, pat in _WANTED_VERSION_PATTERNS if re.search(pat, t)}
+
+
+# --- variant-modifier set (2026-11-16, owner decision 16.11) ----------------
+# Incidents: «timbaland the way i are slowed» returned the ORIGINAL (the
+# ranker — and the confident-match shortcut — love the official upload);
+# «гимли и арагон» returned fan rips. A NAMED variant modifier is part of
+# the user's wish, and a variant UPLOAD is betrayed by its title/channel
+# markers. Two artifacts below form the shared contract other modules are
+# ALLOWED to import (from_source.py / match_score.py; frozen):
+#   VARIANT_WORDS      canonical variant -> tuple of markers;
+#   is_variant_upload  title+channel -> canonical variant or None.
+# Precedence = dict order: a "slowed + reverb" title is SLOWED (the slowed
+# culture's standard pairing; a lone reverb is a different, weaker signal),
+# and nightcore swallows 8d.
+VARIANT_WORDS: dict[str, tuple[str, ...]] = {
+    "slowed": ("slowed", "замедл"),
+    "sped_up": ("sped up", "speed up", "ускорен"),
+    "nightcore": ("nightcore", "8d", "найткор"),
+    "reverb": ("reverb", "реверб"),
+    "remix": ("remix", "remixed", "ремикс"),
+    "acoustic": ("acoustic", "акустич"),
+    # 'live' is deliberately context-gated (see _LIVE_CONTEXT_RE): "Live and
+    # Let Die" / "Living in a Ghost Town" are titles, not takes. A false
+    # positive here demotes real originals, so when in doubt — no match.
+    "live": ("live", "вживую"),
+    "instrumental": ("instrumental", "инструментал"),
+    # "extended" word-boundary covers "extended mix"
+    "extended": ("extended", "extended mix"),
+}
+
+# 'live' counts ONLY with recording context: adjacent to
+# version/ver./session/at/from/concert, the trailing "(Live)" tag, or the
+# unambiguous RU adverb «вживую».
+_LIVE_CONTEXT_RE = re.compile(
+    r"\blive\s+(?:version|session|at|from|concert)\b"
+    r"|\blive\s+ver\."
+    r"|\b(?:version|session|concert)\s+live\b"
+    r"|\(\s*live\s*\)\s*$"
+    r"|\bвживую\b",
+    re.I)
+
+
+def _variant_marker_res() -> dict[str, "re.Pattern"]:
+    """One compiled regex per variant over its markers (all but 'live',
+    which is context-gated). Word-boundary, case-insensitive. Latin markers
+    match as whole words (\b on both sides); Cyrillic markers are STEMS and
+    match as prefixes only (\b on the left) — Russian morphology continues
+    the stem («замедл» must hit «замедленная версия»), a right-hand boundary
+    would break exactly the forms users type."""
+    out = {}
+    for name, markers in VARIANT_WORDS.items():
+        if name == "live":
+            continue
+        parts = []
+        for m in markers:
+            core = re.escape(m).replace(r"\ ", r"\s+")
+            if re.search(r"[а-яё]", m):
+                parts.append(r"\b" + core)
+            else:
+                parts.append(r"\b" + core + r"\b")
+        out[name] = re.compile("|".join(parts), re.I)
+    return out
+
+
+_VARIANT_RES = _variant_marker_res()
+
+
+def is_variant_upload(title: str, channel: str = "") -> str | None:
+    """Канонический вариант ('slowed'...) если заголовок/канал несёт его маркер
+    (word-boundary, case-insensitive; 'slowed' покрывает 'slowed down/slowed+reverb',
+    'sped_up' покрывает 'sped up/speed up', 'nightcore' и '8d' отдельно) иначе None."""
+    import unicodedata
+    text = unicodedata.normalize("NFKC", f"{title or ''} {channel or ''}")
+    for name in VARIANT_WORDS:
+        if name == "live":
+            if _LIVE_CONTEXT_RE.search(text):
+                return name
+        elif _VARIANT_RES[name].search(text):
+            return name
+    return None
+
+
+# LLM#1's free-form target.variant answers fold onto the canonical set.
+_VARIANT_ALIASES = {
+    "8d": "nightcore", "8d audio": "nightcore",
+    "spedup": "sped_up", "sped-up": "sped_up", "sped up": "sped_up",
+    "speedup": "sped_up", "speed up": "sped_up",
+    "slowed down": "slowed", "slowed+reverb": "slowed", "slowed reverb": "slowed",
+    "remixed": "remix", "extended mix": "extended",
+    "night core": "nightcore",
+}
+
+
+def _canonical_variant(raw) -> str:
+    """(2026-11-16) target.variant answer -> a VARIANT_WORDS key or ''.
+    Literal null-words ('null'/'none'/...), unknown values and junk
+    normalize to '': an unparseable variant must never steer the pool."""
+    s = (str(raw) if raw is not None else "").strip().lower()
+    if not s or s in _BLOCK_NULLWORDS:
+        return ""
+    s = _VARIANT_ALIASES.get(s, s.replace("-", "_").replace(" ", "_"))
+    return s if s in VARIANT_WORDS else ""
+
+
+# Variant demotion gap (the choke-point variant guard): mirrors the
+# official-first and scope-demotion 0.05 margins.
+_VARIANT_DEMOTE_GAP = 0.05
 
 # Cover versions: matched contextually, never the bare word — "Cover Drive"
 # (a band) and "Cover Me" (a song) start with cover and must not be banned.
@@ -1182,15 +1294,31 @@ def _format_for_rank(description: str, signals: dict, candidates: list,
     songs of ONE artist — and flags every candidate that does not match the
     scope with a trailing [чужой?] marker (deterministic _scope_match data,
     explained inline; the choke-point demotion guarantees the order even
-    when the ranker ignores the marker)."""
+    when the ranker ignores the marker).
+    (2026-11-16, variant modifiers) signals["variant"] renders the
+    «Вариант-запрос:» line next to «Источник:»/«Исполнитель-запрос:» — the
+    user NAMED an edit version, the original is not the answer. Same
+    transport as the two lines above: mirrored into signals by
+    search_candidates, kept out of the generic Сигналы join.
+    (2026-11-17, incidents 17.11 А/Б) signals["confirmed"] (the frozen
+    fact-search contract) renders ONE rule line and flags every candidate
+    whose title matches a confirmed key with a trailing [подтверждён] —
+    deterministic data, like [neighbor?]/[чужой?]. The ranker zeroed
+    exactly these candidates in the incidents; the line teaches it not to.
+    The dict itself stays out of the generic Сигналы join."""
     src = ((reference or {}).get("source") or "").strip() \
         or (signals.get("source") or "").strip()
     # (2026-11-14, artist-only) same transport as "source": mirrored into
     # signals by search_candidates, rendered as its own line, kept out of
     # the generic Сигналы join.
     scope = (signals.get("scope_artist") or "").strip()
+    # (2026-11-16, variants) same transport again.
+    variant = (signals.get("variant") or "").strip()
+    # (2026-11-17) confirmed keys: the [подтверждён] marker + rule line.
+    conf_keys = _confirmed_keys(signals)
     sig = ", ".join(f"{k}={v}" for k, v in signals.items()
-                    if v and k not in ("source", "scope_artist")) or "—"
+                    if v and k not in ("source", "scope_artist", "variant",
+                                       "confirmed")) or "—"
     lines = [f"Описание: {description}"]
     if src:
         lines.append(f"Источник: {src} (искомый трек должен быть из него)")
@@ -1198,6 +1326,13 @@ def _format_for_rank(description: str, signals: dict, candidates: list,
         lines.append(f"Исполнитель-запрос: {scope} "
                      f"(все кандидаты должны быть его песнями, РАЗНЫЕ песни; "
                      f"метка [чужой?] = не этот исполнитель)")
+    if variant:
+        lines.append(f"Вариант-запрос: {variant} "
+                     f"(искомая редакт-версия, оригинал НЕ ответ)")
+    if conf_keys:
+        lines.append("Подтверждённые (метка [подтверждён]) — принадлежность "
+                     "источнику/запросу проверена факт-поиском: НЕ обнуляй их "
+                     "и не ставь ниже неподтверждённых кандидатов.")
     lines.append(f"Сигналы: {sig}")
     if sonic and any(sonic.values()):
         sn = ", ".join(f"{k}={v}" for k, v in sonic.items() if v)
@@ -1215,9 +1350,14 @@ def _format_for_rank(description: str, signals: dict, candidates: list,
         # (2026-11-14, artist-only) scope non-match flag: cover/reaction
         # uploads of OTHER artists that the discovery pulled in.
         alien = " [чужой?]" if scope and not _scope_match(c, scope) else ""
+        # (2026-11-17, incidents 17.11 А/Б) confirmed-provenance flag: the
+        # title matches a fact-search-confirmed key (deterministic
+        # _matches_confirmed data, explained by the rule line above).
+        conf = (" [подтверждён]" if conf_keys
+                and _matches_confirmed(c.get("title") or "", conf_keys) else "")
         line = (
             f"{i}. video_id={c['video_id']} | {nb}{c['title']} | {c['channel']} | "
-            f"dur={c['duration']}s | views={c['views']}{film}{noise}{alien}"
+            f"dur={c['duration']}s | views={c['views']}{film}{noise}{alien}{conf}"
         )
         # enriched metadata, when present
         if c.get("canonical_artist"):
@@ -1935,11 +2075,78 @@ _OST_BRACKET_RE = re.compile(
     re.IGNORECASE)
 
 
+# (2026-11-17, incident 17.11 В) Fan-edit garbage tails dilute the token
+# intersection this grouping keys on: «Fancy Footwork : by Step up 3 (HD)»
+# cleaned to {fancy,footwork,by,step,up,3} and never grouped with the
+# official «Chromeo - Fancy Footwork» ({chromeo,fancy,footwork}), so the
+# fan re-edit kept its 1.0 rank score over the official's 0.5 and the
+# official-first guard never fired. The tails describe the UPLOAD, not the
+# song — cut them before tokenization (case-insensitive):
+#   « : by Step up 3»  — the uploader's "featured in" credit tail;
+#   trailing (HD)/(4K)/(HD 1080)/[HD]/[4K] — resolution stamps.
+_GARBAGE_TAIL_RES = (
+    re.compile(r"\s*[:：]\s*by\s+.*$", re.I),
+    re.compile(r"\s*\((HD|4K|HD\s*\d*)\)\s*$", re.I),
+    re.compile(r"\s*\[(HD|4K)\]\s*$", re.I),
+)
+
+
 def _group_title_tokens(title: str) -> frozenset:
-    """_title_tokens minus the OST source bracket(s) — the record identity
-    the official-first guard groups by (same comparator as everywhere
-    else, applied to the de-decorated title)."""
-    return _title_tokens(_OST_BRACKET_RE.sub(" ", title or ""))
+    """_title_tokens minus the OST source bracket(s) and the fan-edit
+    garbage tails — the record identity the official-first guard groups by
+    (same comparator as everywhere else, applied to the de-decorated
+    title)."""
+    clean = title or ""
+    for rx in _GARBAGE_TAIL_RES:
+        clean = rx.sub("", clean)
+    return _title_tokens(_OST_BRACKET_RE.sub(" ", clean))
+
+
+# --- confirmed-provenance helpers (2026-11-17, incidents 17.11 А/Б/В) ---
+# Frozen contract (written by the pipelines into signals):
+#   signals["confirmed"] = {"track": "Artist - Track" (sonar-ground SURE;
+#       empty when absent), "songs": ["Artist - Song", ...] (a confident
+#       soundtrack seed, <= 3)}. Both keys optional; unsure probes never
+#       land there. The 17.11 disease was «the ranker does not trust
+#       verified facts»: the ranker zeroed exactly the candidates the fact
+#   search had confirmed (А: the official Mighty Mo Rodgers at top-20;
+#   Б: 14 Step Up 3D seed copies). These helpers expose the same evidence
+#   deterministically to the rank input, the sec4 rescue and the card.
+
+def _confirmed_keys(signals: dict) -> set:
+    """(2026-11-17) Channel-independent identity keys of every CONFIRMED
+    fact in signals: _title_keys of confirmed.track and of each
+    confirmed.songs entry (both the full "artist track" key and, for the
+    "Artist - Track" layout, the track-only part). Empty set when nothing
+    is confirmed — the overwhelming majority of searches — and every
+    consumer keyed on it is a no-op then (byte-for-bit previous behavior)."""
+    conf = (signals or {}).get("confirmed")
+    if not isinstance(conf, dict):
+        return set()
+    keys: set = set()
+    raw = [conf.get("track")] + list(conf.get("songs") or [])
+    for entry in raw:
+        s = (str(entry) if entry is not None else "").strip()
+        if s:
+            keys |= {k for k in _title_keys(s) if k}
+    return keys
+
+
+def _matches_confirmed(title: str, keys: set) -> bool:
+    """(2026-11-17) True when a candidate TITLE carries one of the
+    confirmed keys: the SAME record-identity comparator the official-first
+    grouping uses (_same_record over _group_title_tokens — equal token
+    sets, or a >= 2-token strict subset in either direction). The gate is
+    what keeps short titles safe: a one-word confirmed key ('Hello') can
+    never subset-match 'Adele - Hello' (the smaller side needs >= 2
+    tokens), and equality requires the WHOLE cleaned title to be that one
+    word — one shared word never rides a confirmed mark."""
+    if not keys:
+        return False
+    toks = _group_title_tokens(title or "")
+    if not toks:
+        return False
+    return any(_same_record(toks, frozenset(k.split())) for k in keys if k)
 
 
 async def search_candidates(
@@ -2122,6 +2329,20 @@ async def search_candidates(
                               "channel ban")
                     excluded_artists = _guarded or None
 
+    # --- variant-modifier signal (2026-11-16, owner decision 16.11) ---
+    # LLM#1's target.variant (the SYSTEM_EXTRACT ВАРИАНТ-МОДИФИКАТОР rule)
+    # is the canonical edit version the user NAMED («the way i are slowed»).
+    # It mirrors into signals — the same transport the source anchor and
+    # scope_artist use — so the rank input renders the «Вариант-запрос:»
+    # note (_format_for_rank) and the choke-point variant guard below
+    # presses non-matching candidates under the requested variant's
+    # uploads. Unknown/null answers canonicalize to '': no variant, no
+    # behavior change (the previous path bit-for-bit).
+    variant = _canonical_variant(target.get("variant")) if isinstance(target, dict) else ""
+    if variant:
+        signals["variant"] = variant
+        extract["signals"] = signals
+
     # Destructive-content verdict from the LLM — before any YouTube requests.
     # Literal null-words ("null"/"none"/...) mean no category (sec2): normalize
     # to '' so the moderation chain never compares a phantom category string.
@@ -2234,11 +2455,42 @@ async def search_candidates(
             # noise, so ask again. The rank-NOT-answered path (empty verdict,
             # default scores 0) is the legitimate preview fallback and passes
             # untouched; surprise never calls LLM#2 and is excluded.
-            out.candidates = []
-            out.best_index = -1
-            out.need_clarify = True
-            out.clarify_question = _EMPTY_RESULT_CLARIFY
-            _log.info("rank zeroed all candidates -> clarify (intent=%s)", intent)
+            # (2026-11-16, acceptance r2/r3) VARIANT REQUESTED: the ranker
+            # zeroes the pool under a variant request both when the edit is
+            # ABSENT (the fallback below delivers the original with a note)
+            # and when it EXISTS but the ranker was too strict (the variant
+            # guard below then reorders properly). Either way emptying the
+            # pool here only produces the circular clarify — keep it.
+            _vr_zero_miss = bool(variant)
+            if _vr_zero_miss:
+                _log.info("rank zeroed, but variant miss keeps the pool "
+                          "for the fallback (%s)", variant)
+            else:
+                # (2026-11-17, incidents 17.11 А/Б) CONFIRMED-PROVENANCE
+                # RESCUE — the generalization of the variant exception
+                # above: the ranker zeroed the whole pool, but some
+                # candidates are CONFIRMED by the fact search
+                # (signals["confirmed"]); zeroing them was the ranker's
+                # mistake, not the pool's. Keep the pool — the official-
+                # first / variant / scene-clip guards below order it — and
+                # drop the circular clarify (the fact search already
+                # answered what the clarify would ask for).
+                _conf_keys = _confirmed_keys(signals)
+                _conf_n = (sum(1 for c in out.candidates
+                               if _matches_confirmed(c.title, _conf_keys))
+                           if _conf_keys else 0)
+                if _conf_n:
+                    _log.info("rank zeroed, but %d confirmed candidate(s) "
+                              "keep the pool", _conf_n)
+                    out.need_clarify = False
+                    out.clarify_question = ""
+                else:
+                    out.candidates = []
+                    out.best_index = -1
+                    out.need_clarify = True
+                    out.clarify_question = _EMPTY_RESULT_CLARIFY
+                    _log.info("rank zeroed all candidates -> clarify (intent=%s)",
+                              intent)
         elif norm_intent in {"similar", "mood"} and len(out.candidates) > 2:
             # s1/m3: the pre-rank diversity guard collapses same-record copies,
             # but LLM#2 re-sorts the pool and 4-5 copies of one record surface
@@ -2405,6 +2657,113 @@ async def search_candidates(
                                           _group_title_tokens(c.title), bt)), i)
                         out.best_index = i
 
+        # --- variant-first guard (2026-11-16, owner decision 16.11) ---
+        # Runs AFTER official-first on purpose: a requested variant IS a
+        # fan edit, and official-first would clamp it under the original;
+        # the user's named variant outranks the official upload, so this
+        # guard must have the last word. Incidents: «timbaland the way i
+        # are slowed» returned the original. With signals["variant"] set
+        # (canonical), the final pool partitions by is_variant_upload:
+        #   matching  — the detector returns the requested variant;
+        #   originals — the detector returns None (official uploads too);
+        #   foreign   — the detector returns a DIFFERENT variant.
+        # matching candidates keep their own scores (no boost needed);
+        # every non-matching candidate is pressed under the weakest
+        # matching one (score = min(own, min(matching) - gap), the
+        # official-first scheme), and foreign variants one gap lower still
+        # (an original beats a WRONG variant). Stable re-sort; best_index
+        # follows its video_id, and a best that was not a matching upload
+        # hands its slot to the pool's new leader (a matching one by
+        # construction). No matching candidate at all — the pool stands
+        # exactly as ranked (the requested variant does not exist on
+        # YouTube; today's ranking decides) plus one log line and the
+        # variant-miss fallback (2026-11-16, incident 16.11) inside that
+        # branch: an honest intro note, and a rank clarify over the
+        # non-empty pool converts to a delivery. No variant
+        # requested — this guard is a no-op.
+        if variant and out.candidates:
+            _vr_hits = [(c, is_variant_upload(c.title, c.channel))
+                        for c in out.candidates]
+            _vr_matching = [c for c, det in _vr_hits if det == variant]
+            if not _vr_matching:
+                _log.info("variant requested, none found (%s) — pool unchanged",
+                          variant)
+                # --- variant-miss fallback (2026-11-16, incident 16.11) ---
+                # The rank input carried the «Вариант-запрос:» note
+                # («оригинал НЕ ответ»), the pool holds no matching upload
+                # and the search still did not dead-end: the ranker either
+                # answered need_clarify over a NON-EMPTY pool (the incident:
+                # «the weeknd blinding lights sped up» -> the circular
+                # «name the artist» ask when the artist WAS named) or the
+                # pool is being delivered as ranked. Owner product rule: a
+                # variant miss is not a dead end — the edit may simply not
+                # exist on YouTube, so the ORIGINAL is a legitimate fallback,
+                # and it ships with an honest note, never silently:
+                #   (a) need_clarify over a non-empty pool -> convert to a
+                #       delivery: the question is dropped, the candidates
+                #       stay exactly as they lay (the stable zero-score sort
+                #       keeps the originals on top);
+                #   (b) a delivered pool -> the delivery stands.
+                # An EMPTY pool is none of this fallback's business (the
+                # honest empty path keeps its meaning with or without a
+                # variant): the enclosing `out.candidates` check is that
+                # guard. A matching upload never reaches here — bit-for-bit
+                # previous behavior, no note.
+                if out.need_clarify:
+                    out.need_clarify = False
+                    out.clarify_question = ""
+                _en = str((signals or {}).get("language") or "").lower().startswith("en")
+                out.intro = ((out.intro + " ") if out.intro else "") + (
+                    f"No exact {variant} version found - showing the closest."
+                    if _en else
+                    f"Точной {variant}-версии не нашёл — показываю ближайшее.")
+                _log.info("variant miss fallback: delivered %d candidates, "
+                          "note added (%s)", len(out.candidates), variant)
+            else:
+                # (2026-11-16, acceptance r4 V5/V6) the requested edit IS in
+                # the pool and heads it — the ranker's clarify is moot, the
+                # answer exists; delivering it beats asking again.
+                if out.need_clarify:
+                    out.need_clarify = False
+                    out.clarify_question = ""
+                    _log.info("variant guard: matching upload clears the "
+                              "ranker clarify")
+                _vr_best = (out.candidates[out.best_index]
+                            if 0 <= out.best_index < len(out.candidates) else None)
+                _vr_best_vid = (_vr_best.video_id
+                                if _vr_best is not None
+                                and any(_vr_best is m for m in _vr_matching) else "")
+                _vr_floor = round(min(c.score for c in _vr_matching)
+                                  - _VARIANT_DEMOTE_GAP, 4)
+                _vr_demoted = 0
+                # tier 1: originals (incl. the official upload) under the
+                # weakest matching upload
+                for c, det in _vr_hits:
+                    if det is None and c.score > _vr_floor:
+                        c.score = _vr_floor
+                        _vr_demoted += 1
+                # tier 2: foreign variants one more gap down, below the
+                # weakest original as well (an original beats a wrong
+                # variant, however weak)
+                _vr_orig_min = min(
+                    (c.score for c, det in _vr_hits if det is None),
+                    default=_vr_floor)
+                _vr_foreign_floor = round(_vr_orig_min - _VARIANT_DEMOTE_GAP, 4)
+                for c, det in _vr_hits:
+                    if det is not None and det != variant and c.score > _vr_foreign_floor:
+                        c.score = _vr_foreign_floor
+                        _vr_demoted += 1
+                if _vr_demoted:
+                    _log.info("variant guard: demoted %d non-matching "
+                              "candidate(s) below the requested %r upload(s)",
+                              _vr_demoted, variant)
+                # stable re-sort by score: matching uploads (all above the
+                # floors) lead, ties keep the current order
+                out.candidates.sort(key=lambda c: -c.score)
+                _vr_i = next((k for k, c in enumerate(out.candidates)
+                              if c.video_id == _vr_best_vid), None)
+                out.best_index = _vr_i if _vr_i is not None else 0
+
         # --- circular-clarify sanitizer (13.11, incident: F1 search asked
         # «Уточните исполнителя или название» on a from_source hunt). A user
         # searching music FROM a film/game/ad by definition does not know
@@ -2498,4 +2857,31 @@ async def search_candidates(
                               "honest repeat",
                               out.candidates[out.best_index].title[:40],
                               _FRESH_MIN_SCORE)
+
+        # --- confirmed-track card override (2026-11-17, incident 17.11 В) ---
+        # The best candidate may be a fan upload whose ytdlp-enriched artist
+        # is the UPLOADER («吳昇諳»), while the fact search already confirmed
+        # the real record. When confirmed.track is set and the best
+        # candidate matches it, the confirmed names override the card's
+        # canonical fields — the handler and the web card already prefer
+        # the enriched fields (c.__dict__ carries them), so the garbage
+        # channel name never reaches the user's card. No confirmed fact or
+        # no match — a no-op, byte-for-bit previous behavior.
+        _conf_tr = ""
+        if isinstance(signals.get("confirmed"), dict):
+            _conf_tr = str((signals["confirmed"].get("track") or "")).strip()
+        if (_conf_tr and out.candidates
+                and 0 <= out.best_index < len(out.candidates)):
+            _ct_best = out.candidates[out.best_index]
+            if _matches_confirmed(_ct_best.title,
+                                  {k for k in _title_keys(_conf_tr) if k}):
+                if " - " in _conf_tr:
+                    _ct_artist, _ct_track = (x.strip() for x in
+                                             _conf_tr.split(" - ", 1))
+                else:
+                    _ct_artist, _ct_track = "", _conf_tr
+                _ct_best.canonical_artist = _ct_artist
+                _ct_best.canonical_track = _ct_track
+                _log.info("confirmed card: best '%s' canonical -> %r / %r",
+                          _ct_best.title[:40], _ct_artist, _ct_track)
     return out

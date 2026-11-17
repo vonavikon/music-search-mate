@@ -99,7 +99,7 @@ def _yt_entries():
     return [
         {"video_id": "v1", "title": "Cool Soundtrack Theme", "channel": "Film Orchestra",
          "duration": 240, "views": 500000},
-        {"video_id": "v2", "title": "Another OST Cue", "channel": "Score House",
+        {"video_id": "v2", "title": "Another OST Cue", "channel": "Score House - Topic",
          "duration": 300, "views": 100000},
         {"video_id": "v3", "title": "Soft End Titles", "channel": "Piano Duo",
          "duration": 270, "views": 50000},
@@ -401,7 +401,7 @@ def _live_entries():
          "title": "Akhenaton, La Cosca Scratch by DJ Pone - Ultime Poursuite (OST Taxi)",
          "channel": "Taxi OST - Topic", "duration": 260, "views": 800000},
         {"video_id": "ostvid2", "title": "Sur La Route - Taxi OST",
-         "channel": "Score House", "duration": 300, "views": 90000},
+         "channel": "Score House - Topic", "duration": 300, "views": 90000},
     ]
 
 

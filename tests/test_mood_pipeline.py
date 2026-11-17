@@ -873,6 +873,12 @@ _EXTRACT_MOOD_LINES = [
     # Security battery (sec1/sec9): the action-vs-topic invariant on the
     # block rule — «музыка ДЛЯ вреда» is a block, «песня ПРО» is not.
     'Исключение: музыка ДЛЯ реального вреда („музыка для убийства“, „для пыток“, „подрезы для драки“) = блок; песня ПРО (про убийцу, про войну, про суицид) = не блок.',
+    # (2026-11-16, variant modifiers) the NEW set lines, added separately:
+    # the variant enum inside the target JSON line + the ВАРИАНТ-МОДИФИКАТОР
+    # rule next to the target rules (owner decision 16.11).
+    '"variant": "slowed|sped_up|nightcore|reverb|remix|acoustic|live|instrumental|extended|null"',
+    '- ВАРИАНТ-МОДИФИКАТОР (решение 16.11): вариант-модификатор (slowed, sped up, nightcore, reverb, remix, acoustic, live, instrumental, extended, 8d) — ЧАСТЬ пожелания пользователя, а не шум',
+    'сохрани модификатор в queries ("the way i are slowed") и НЕ нормализуй запрос к оригиналу; модификатор не назван -> null.',
 ]
 
 # Tripwire: OLD rule substrings that must survive byte-identical (the prompt
@@ -881,7 +887,10 @@ _EXTRACT_OLD_RULES = [
     "Сейчас ты работаешь как анализатор запроса музыкального бота.",
     '"intro": "короткая фраза-справка, ЧТО ищем',
     '"signals": {"language": "...|null", "era": "напр. 1980s|null", "vocal": "male|female|instrumental|null", "genre": "...|null", "mood": "...|null"}',
-    '"target": {"artist": "...|null", "track": "...|null"}',
+    # (2026-11-16, variant modifiers) updated: the target JSON line gained
+    # the "variant" field (the prompt line changed, so the tripwire entry
+    # follows it; the NEW set lines live separately in _EXTRACT_MOOD_LINES).
+    '"target": {"artist": "...|null", "track": "...|null", "variant": "slowed|sped_up|nightcore|reverb|remix|acoustic|live|instrumental|extended|null"}',
     '"reference": {"artist": "...|null", "track": "...|null", "source": "источник из запроса (фильм/игра/сериал/реклама, оригинальное написание)|null — только при intent=from_source"}',
     '"sonic": {"tempo": "...|null", "instrumentation": "...|null", "dynamics": "...|null", "vocal_timbre": "...|null"}',
     '"association_candidates": [{"artist": "...", "track": "...", "rationale": "почему этот артист звучит похоже на референс"}]',

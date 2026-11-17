@@ -106,15 +106,104 @@ async def _search_youtube(queries: list, on_progress=None, trace=None) -> list:
     return raw
 
 
+# (2026-11-17, incident A — the coffee case) The heuristic filter's top-20
+# sorts by views: eight copies of the EXACT target track (small-view
+# uploads of a niche song) were crowded out by 300M-view neighbors and only
+# one copy survived, leaving the rank stage a single copy to misjudge.
+# wanted = channel-independent title keys (_title_keys: the full cleaned
+# title plus the track part of an "Artist - Track" layout) of the exact
+# target; from_source composes it from the confirmed sonar phrase and the
+# extract's target.track. Survival semantics (what _wanted_survival
+# enforces):
+#   - a candidate whose title keys intersect wanted KEEPS its slot, and
+#     matches take the HEAD of the list — the enrich pass and the rank
+#     input read the top slice, tail slots are invisible to the ranker;
+#   - at least _WANTED_MIN_SLOTS slots are held for wanted copies, pulled
+#     straight from raw when the views sort dropped them. The rescue
+#     deliberately bypasses the title dedup (it collapses same-track
+#     uploads to one): several copies in the rank input is the fix;
+#   - the rescue respects _filter_candidates' own gates (the duration
+#     window, the trailer/studio channel, the non-music title) — a
+#     30-second clip or a trailer titled like the track is never rescued.
+# The `wanted` PARAMETER of _filter_candidates itself is VERSION-CLASS
+# semantics (_NOISE_KEY words that lift a noise penalty for an explicitly
+# requested version) — title keys are deliberately NOT forwarded into it
+# (a track literally named "Live" would lift the live penalty pool-wide);
+# the survival guarantee lives here instead. None/empty wanted (every
+# other caller: legacy run, this_track/mood/similar/surprise) keeps
+# today's behavior untouched.
+_WANTED_MIN_SLOTS = 3
+
+
+def _wanted_survival(raw: list, filtered: list, wanted: set[str] | None) -> list:
+    """(2026-11-17) Reorder/augment the filter's output so exact-target
+    copies survive AND lead: [wanted matches, non-noise first then -views]
+    + [the rest in filter order]. Rescued raw dicts are annotated with
+    is_noise exactly as _filter_candidates annotates its survivors (the
+    rank tail's live demotion reads it off the Candidate). Returns the new
+    list (filtered itself is never mutated). No-op without wanted."""
+    if not wanted:
+        return filtered
+    # Lazy per-call imports: the monkeypatchable services.llm_search
+    # namespace (the same convention as every stage helper here).
+    from services.llm_search import (
+        _NON_MUSIC_TITLE_RE,
+        _has_noise,
+        _is_trailer_or_studio,
+        _title_keys,
+    )
+
+    def _match(cand: dict) -> bool:
+        return bool(_title_keys(cand.get("title") or "") & wanted)
+
+    def _eligible(cand: dict) -> bool:
+        # _filter_candidates' own gates, so the rescue never pulls back
+        # something the gates rightly dropped (a short clip, a trailer, a
+        # non-music titling).
+        if cand.get("duration") and not 60 <= cand["duration"] <= 900:
+            return False
+        if _is_trailer_or_studio(cand):
+            return False
+        return not _NON_MUSIC_TITLE_RE.search(cand.get("title") or "")
+
+    head = [c for c in filtered if _match(c)]
+    rest = [c for c in filtered if not _match(c)]
+    in_ids = {c.get("video_id") for c in filtered}
+    rescued = 0
+    for c in raw:
+        if len(head) >= _WANTED_MIN_SLOTS:
+            break
+        vid = c.get("video_id")
+        if vid in in_ids or not _match(c) or not _eligible(c):
+            continue
+        c["is_noise"] = _has_noise(c.get("title") or "")
+        head.append(c)
+        in_ids.add(vid)
+        rescued += 1
+    if not head:
+        return filtered                     # nothing matches anywhere
+    head.sort(key=lambda c: (1 if c.get("is_noise") else 0,
+                             -(c.get("views") or 0)))
+    if rescued:
+        _log.info("wanted survival: rescued %d exact-target cop%s into the "
+                  "head of the filter top slice", rescued,
+                  "y" if rescued == 1 else "ies")
+    return head + rest
+
+
 async def _filter_and_enrich(raw: list, excluded_ids: set[str] | None = None,
                              excluded_artists: set[str] | None = None,
                              excluded_titles: set[str] | None = None,
-                             metadata_svc=None, on_progress=None, trace=None) -> tuple[list, list]:
+                             metadata_svc=None, on_progress=None, trace=None,
+                             wanted: set[str] | None = None) -> tuple[list, list]:
     """steps 4-4.5: heuristic filter, refinement exclusions, top-5 enrich,
     non-music drop. Returns (filtered, enriched) — the enriched list holds
     copies with canonical fields for the top-5 only. excluded_titles (new,
     live-test F2; None = previous behavior) drops candidates by normalized
-    TITLE so the same song cannot return from another channel/upload."""
+    TITLE so the same song cannot return from another channel/upload.
+    wanted (2026-11-17, incident A; None = previous behavior) — title keys
+    of the exact target: matching copies are guaranteed survival at the
+    HEAD of the top slice (_wanted_survival)."""
     from services.llm_search import (
         _filter_candidates,
         _is_non_music,
@@ -128,6 +217,11 @@ async def _filter_and_enrich(raw: list, excluded_ids: set[str] | None = None,
     # a no-op without a subscriber (web/metrics.py).
     _t0 = time.perf_counter()
     filtered = _filter_candidates(raw, target_n=20)
+    # (2026-11-17, incident A) wanted-survival: exact-target copies keep
+    # their slots and lead the top slice (see _wanted_survival). Runs BEFORE
+    # the refinement excludes below, so a rejected title still wins over the
+    # rescue — a restart must never re-serve the rejected song.
+    filtered = _wanted_survival(raw, filtered, wanted)
     # Refinement: deterministically drop rejected video_ids before ranking.
     # LLM text ("not this artist") is hope; a hard video_id exclude is the
     # guarantee that a rejected clip won't return in the refined results.

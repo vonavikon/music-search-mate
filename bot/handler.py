@@ -1460,7 +1460,14 @@ async def _finish_search(update, context, status, out, desc, user):
     # user picks the song from the preview (see the branch below the degraded
     # one). getattr: scope_artist is core-owned and may be absent.
     _artist_only = bool(getattr(out, "scope_artist", ""))
-    auto = (bool(best) and should_auto_download(out.intent, best.match_score)
+    # (2026-11-16) variant request: the ORIGINAL must not auto-download -
+    # the user asked for the slowed/sped/... edit, non-variant candidates
+    # only preview (want_variant plumbing, match_score._variant_upload)
+    _want_variant = str((out.signals or {}).get("variant") or "")
+    auto = (bool(best) and should_auto_download(out.intent, best.match_score,
+                                                want_variant=_want_variant,
+                                                title=best.title if best else "",
+                                                channel=best.channel if best else "")
             and not ambiguous and not _artist_only)
 
     # Persist match_score and the auto/preview decision to queries so Store logs can

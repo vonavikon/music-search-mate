@@ -46,15 +46,51 @@ AUTO_SIMILAR = 0.85
 AMBIGUITY_GAP = 0.08   # top1-top2 match_score gap below this = ambiguous
 
 
-def should_auto_download(intent: str, match_score: float) -> bool:
+def should_auto_download(intent: str, match_score: float, want_variant: str = "",
+                         title: str = "", channel: str = "") -> bool:
     """Auto-download decision from the rule-based match_score and intent.
     from_source is always preview. this_track/similar auto-download on a strong
     match above the intent threshold. Single decision point — the handler calls
-    this, never the threshold directly."""
+    this, never the threshold directly.
+
+    (2026-11-16) want_variant: the user explicitly asked for a variant upload
+    ("slowed", "sped up", ... — the VARIANT_WORDS vocabulary). When set and the
+    best candidate is NOT a variant upload (is_variant_upload -> None), the
+    answer is False regardless of the score: the ORIGINAL must not download
+    silently — the user picks the wanted variant from the top-3 preview.
+    title/channel describe that best candidate. Detection is the
+    services.llm_search contract (VARIANT_WORDS + is_variant_upload, a parallel
+    workstream): while that helper has not landed there, _variant_upload
+    returns None and the decision keeps the previous behavior. The handler does
+    not pass want_variant yet (backward compatible; the reviewer wires the call
+    once both sides land)."""
+    if (want_variant or "").strip():
+        variant = _variant_upload(title, channel)
+        if variant is False:
+            return False    # the original under a variant ask: preview, never auto
     if intent == "from_source":
         return False
     threshold = AUTO_THIS_TRACK if intent == "this_track" else AUTO_SIMILAR
     return match_score >= threshold
+
+
+def _variant_upload(title: str, channel: str) -> bool | None:
+    """(2026-11-16) Variant-upload detection delegated to
+    services.llm_search.is_variant_upload(title, channel) — True for a variant
+    upload, False for the original, None when detection is UNAVAILABLE (the
+    helper has not landed in llm_search yet, or it raised). Callers treat None
+    as "keep the previous behavior", NOT as "not a variant": a missing
+    dependency must not silently flip auto-downloads off. Lazy import inside
+    the function: match_score deliberately never imports llm_search at module
+    level (the same circular-import care as _channel_is_reference)."""
+    try:
+        from services.llm_search import is_variant_upload
+    except ImportError:
+        return None
+    try:
+        return bool(is_variant_upload(title or "", channel or ""))
+    except Exception:
+        return None
 
 
 def is_ambiguous(candidates: list, best_index: int, confidence: str) -> bool:

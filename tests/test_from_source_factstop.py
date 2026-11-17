@@ -129,6 +129,11 @@ async def _run(bothub_client, description, extract, entries, rank=None,
         if gen_name == "sonar-seed":
             captured["seed_q"] = user
             return seed
+        if gen_name == "sonar-ground-probe":
+            # (2026-11-16) the relaxed probe fires when the sure-only seed
+            # added nothing (this scenario's seed is unsure=None): a None
+            # answer adds no query, the call order gains one entry.
+            return None
         if gen_name == "sonar-factstop":
             captured["factstop_q"] = user
             captured["factstop_system"] = system
@@ -199,7 +204,8 @@ async def test_low_score_sonar_false_stops_delivery_and_names_songs(
     assert "официальном саундтреке" in captured["factstop_system"]
     # the call order: ground first (a miss), the soundtrack seed (unsure —
     # adds nothing, 2026-11-14 F1 layer), rank, then the verification
-    assert captured["calls"] == ["sonar-ground", "sonar-seed", "llm-rank",
+    assert captured["calls"] == ["sonar-ground", "sonar-seed",
+                                 "sonar-ground-probe", "llm-rank",
                                  "sonar-factstop"]
     # the honest clarify shape (the same mechanism as the escalation return)
     assert out.need_clarify

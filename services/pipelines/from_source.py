@@ -118,6 +118,68 @@ and they lead the query list before the descriptive phrases (the
 _MAX_QUERIES cap unchanged). Tolerant like every sonar layer here: an
 error/timeout/garbage answer skips the seed and the search runs as before.
 
+UNSURE GROUND PROBE + OFFICIALS-ONLY DELIVERY (16.11 incident, 2026-11-16).
+Prod case: «песня где гимли и арагон бегут по горам» (RU: "the song where
+Gimli and Aragorn run through the mountains") — the sonar ground HAD the
+answer (Howard Shore "The Riders of Rohan") but with sure=false, and the
+deployed _sonar_ground (llm_search) keeps sure-only answers, so the guess
+was dropped; the soundtrack seed is sure-only too, discovery ran on the
+descriptive LLM queries alone, fan rips with film footage (TheLotrTV,
+jediking12 "CR - ..." cuts) won the rank, and the user got "videos"
+instead of music. Two layers land here:
+(1) PROBE: on a ground-MISS, SOURCE-LESS, plain (non-analog) from_source
+search, ONE tolerant sonar question ("best guess even if unsure") may put
+the guessed "{artist} - {track}" at the head of the ytsearch queries —
+a recall recovery that is strictly a QUERY: never a source-fact-cache
+entry, never a reference/ban key, never an analog-chain input. With a
+source name the sure-only soundtrack seed already owns the ground-miss
+recovery (and pays its own call), so the probe stays off there; an
+analog-marked description never probes (a guessed reference track as
+query #1 would fight the reference ban the chain applies).
+(2) OFFICIALS-ONLY GATE (owner decision): after the rank tail, the
+scene-clip demotion and the fact-stop, a plain from_source pool with ZERO
+official-quality candidates (a "- Topic" channel, a VEVO channel, an
+"Official" title, channel == the candidate's canonical artist, or a known
+soundtrack label channel) does not deliver: fan rips are not an answer —
+the honest clarify asks for a sharper scene or the artist name. One
+official anywhere in the pool is enough to deliver as today (the order
+guards already work). The analog chain (similar rank mode) is never
+gated: it is a reference hunt where a fan pool is fine.
+(3) SCENE-CLIP DEMOTION GUARD (16.11 acceptance follow-up, 2026-11-16):
+with officials in the pool the officials-only gate sleeps, and the rank
+could still crown a scene-clip montage over them (the acceptance case:
+the ClipZone "... | Warg Attack" clip took llm 0.90 over the official
+Annie Lennox/Emiliana Torrini tracks — the prompt's "no video clips"
+rule loses to a strong title match). After the officials-only gate and
+before delivery, every scene-clip candidate (_is_scene_clip: clip/scene/
+moment/edit/fans channel markers, a "TV" channel suffix like TheLotrTV,
+a "CR - " Complete Recordings rip title) is scored below the WEAKEST
+official (min(own, min_official - 0.05)); officials are never touched
+(officialness is decided first). Without officials nothing is demoted —
+that pool is the officials-only gate's honest clarify, not this guard's.
+
+CONFIRMED SIGNALS + FILTER WANTED (17.11 incidents, 2026-11-17). Incidents:
+(B) a SURE sonar seed of 3 soundtrack songs survived the filter's top-20
+but the ranker zeroed them with a false "not from the source"; (C) a SURE
+sonar ground of "Chromeo - Fancy Footwork" scored 0.0 on the official clip
+and 1.0 on a fan video titled "Step up"; (A) the coffee search (a known
+target.track) had 8 copies of the right track in raw but the views-sorted
+top-20 kept 1. Two layers:
+(1) SIGNALS: run() writes signals["confirmed"] = {"track": <the sure
+ground concrete "Artist - Track" or "">, "songs": [<the sure-seeded
+soundtrack songs, up to 3>]} — the frozen llm_search contract; the
+rank-side protection built on it is llm_search's work (another agent's
+file). Written BEFORE _rank_and_decide: f.signals is the rank-input
+transport (the same slot scope_artist rides) and rides the final SearchOut.
+Strict shape: empty values are written empty, never omitted; the
+unsure-probe phrase is a guess and never lands there.
+(2) WANTED: run() composes wanted = _title_keys(confirmed.track) |
+_title_keys(target.track) and threads it into _filter_and_enrich, whose
+wanted-survival guarantee (legacy.py, _wanted_survival) pins exact-target
+copies into the HEAD of the filter's top slice — several copies in the
+rank input is the incident-A fix. The analog chain passes no wanted (its
+confirmed track is the banned reference).
+
 Stateless like every SearchPipeline: one shared instance serves concurrent
 searches; per-search state travels in the PipelineContext.
 """
@@ -650,6 +712,306 @@ async def _soundtrack_seed(ctx: PipelineContext) -> list:
     return songs
 
 
+# --- unsure ground probe (16.11 incident, 2026-11-16) ---
+# The pre-pool sonar ground answers through llm_search._sonar_ground, whose
+# contract keeps SURE answers only — the 16.11 guess (Howard Shore, sure=false)
+# was dropped there and nothing led discovery but the descriptive queries.
+# This layer asks its own small TOLERANT question (the _factstop_verify /
+# _soundtrack_seed pattern: bothub.chat_json, its own system prompt and
+# gen_name, latched on ctx) and turns an explicitly-unsure complete guess
+# into the FIRST ytsearch query. Strictly a query: no fact-cache write, no
+# reference/ban key, no analog-chain input (see the wiring condition in
+# FromSourcePipeline.run).
+_PROBE_SYSTEM = (
+    "Ты — поисковик фактов о музыке. Пользователь описывает сцену/кадр из "
+    "фильма, игры или рекламы. Назови ЛУЧШУЮ ДОГАДКУ трека (артист и "
+    "название) — даже если не уверен. Верни СТРОГО JSON без markdown: "
+    '{"artist": "...", "track": "...", "sure": true|false}. '
+    "sure=false, если однозначного ответа нет. Никогда не выдумывай названия."
+)
+
+
+def _probe_phrase(ans) -> str:
+    """Tolerant parse of the raw probe answer -> the "{artist} - {track}"
+    ytsearch phrase. ONLY an explicitly-unsure (sure is False) complete guess
+    becomes a phrase: sure=true answers are the regular ground's territory
+    (its sure-only filter would have kept them — a probe sure=true means the
+    concrete path already leads, no duplicate query), and a missing/garbage
+    sure field is not a usable unsure signal. Control characters are scrubbed
+    (the _SEED_CTRL_RE one-line rule). "" on anything else — never an
+    exception (the auxiliary doctrine)."""
+    if not isinstance(ans, dict):
+        return ""
+    artist, track = ans.get("artist"), ans.get("track")
+    if not isinstance(artist, str) or not isinstance(track, str):
+        return ""
+    artist = " ".join(_SEED_CTRL_RE.sub(" ", artist).split())
+    track = " ".join(_SEED_CTRL_RE.sub(" ", track).split())
+    if not artist or not track:
+        return ""
+    sure = ans.get("sure")
+    if isinstance(sure, str):
+        sure = sure.strip().lower() in ("true", "да", "yes")
+    return f"{artist} - {track}" if sure is False else ""
+
+
+async def _unsure_ground_probe(ctx: PipelineContext) -> str:
+    """(2026-11-16) The ONE tolerant ground question per search (the
+    ctx-level latch _probe_ground_result — the _factstop_result pattern):
+    at most one probe call whatever calls the flow makes. Returns the
+    "{artist} - {track}" guess phrase, "" when the answer is garbage, a
+    miss, or the call failed (errors are swallowed — the probe layer is
+    strictly auxiliary and never raises, the _sonar_ground doctrine). The
+    caller owns the firing condition (ground-concrete empty; see run)."""
+    bothub = ctx.bothub
+    cached = getattr(ctx, "_probe_ground_result", None)
+    if cached is not None:
+        return cached
+    phrase = ""
+    try:
+        ans = await bothub.chat_json(
+            _PROBE_SYSTEM,
+            f"Пользователь ищет музыку: {ctx.description!r}. "
+            f"Лучшая догадка трека (артист и название), даже если не уверен. "
+            f'Ответь строго JSON: {{"artist": "", "track": "", '
+            f'"sure": true|false}}',
+            max_tokens=300, trace=ctx.trace, gen_name="sonar-ground-probe",
+            model=bothub._sonar_model)
+        phrase = _probe_phrase(ans)
+    except Exception as e:
+        _log.warning("unsure ground probe failed (probe skipped): %s",
+                     str(e)[:100])
+    ctx._probe_ground_result = phrase
+    return phrase
+
+
+# --- officials-only delivery gate (16.11 incident, owner decision,
+# 2026-11-16) --- A YouTube Music auto-channel suffix ("Howard Shore - Topic";
+# the dash family -/–— tolerated, the same class as _channel_key).
+_TOPIC_CHANNEL_RE = re.compile(r"\s*[-–—]\s*topic\s*$", re.I)
+# Known official soundtrack label channels (casefolded compares). A SHORT
+# seed list by design — expand as production misses surface. The other
+# criteria below already cover the bulk of official uploads; this list only
+# adds the score-label shape (an OST cue often lives on the LABEL's channel,
+# not the composer's Topic).
+_SOUNDTRACK_LABEL_CHANNELS = {
+    "watertower music",
+    "back lot music",
+    "hollywood records",
+    "sony soundtracks",
+}
+
+
+def _is_official_upload(candidate, known_artists: tuple = ()) -> bool:
+    """(2026-11-16) Is this candidate an official-quality upload? The criteria
+    are deliberately WIDE (any ONE qualifies): a false "official" costs a
+    normal delivery, a false "fan" costs the honest clarify — the owner's
+    16.11 rule. Signals, all already-fetched (no new calls):
+      - the channel ends with the YouTube Music "- Topic" suffix;
+      - the channel carries VEVO;
+      - the TITLE says "Official" (official video/audio/... — a fan rip
+        naming itself official is vanishingly rare);
+      - the CHANNEL says "official" (16.11 review: official artist
+        channels are literally named "Band Official" / "... Official";
+        a fan CHANNEL calling itself official does not happen);
+      - the channel IS the candidate's canonical artist (the enriched top-5's
+        canonical_artist, already riding on every Candidate — the artist's
+        own channel is official by definition);
+      - the channel is a known soundtrack label (the short list above);
+      - (16.11 review) the channel IS an artist the search already KNOWS -
+        ground/probe/seed sonar answers carry the artist name, and score
+        uploads often live ONLY on the composer's own channel (the LoTR
+        case: no Topic uploads at all, "Howard Shore" the official channel);
+        enrichment may be missing, the sonar names are free.
+    Tolerant of shape: anything unreadable parses as a fan upload."""
+
+    from services.llm_search import _channel_key, _ref_key
+
+    known_keys = {_ref_key(a.removesuffix(" - Topic"))
+                  for a in known_artists if (a or "").strip()}
+    channel = (getattr(candidate, "channel", "") or "").strip()
+    title = (getattr(candidate, "title", "") or "")
+    if _TOPIC_CHANNEL_RE.search(channel):
+        return True
+    if known_keys and _ref_key(channel) in known_keys:
+        return True
+    ch_lc = channel.casefold()
+    if "vevo" in ch_lc:
+        return True
+    if re.search(r"\bofficial\b", ch_lc):
+        return True
+    if "official" in title.casefold():
+        return True
+    if ch_lc in _SOUNDTRACK_LABEL_CHANNELS:
+        return True
+    canon = (getattr(candidate, "canonical_artist", "") or "").strip()
+    if canon and channel and _channel_key(channel) == _ref_key(canon):
+        return True
+    return False
+
+
+# --- scene-clip markers (16.11 incident acceptance, 2026-11-16) ---
+# Fan clip-channel words in the CHANNEL name. Boundary choices are the
+# conservative ones: "clip" keeps only its LEADING boundary so glued names
+# still match ("ClipZone", "MovieClips") while an inside-a-word hit never
+# fires ("eclipse" — a real label-shaped word — is NOT a clip); the rest
+# are fully word-bounded ("torment" must never read as a "moment",
+# "credits" never as an "edit"). "videos" is deliberately NOT a marker: a
+# channel like "Official Top Videos" belongs to the officials criterion
+# above, not to the clip detector.
+_SCENE_CLIP_CHANNEL_RE = re.compile(
+    r"\bclips?"                                # ClipZone / MovieClips / clips
+    r"|\b(?:scenes?|moments?|edits?|fans)\b",
+    re.I)
+# Fan "TV" stations: the channel name ENDS in TV (TheLotrTV — a fan
+# broadcast-shaped name).
+_SCENE_CLIP_TV_RE = re.compile(r"tv\s*$", re.I)
+# Complete Recordings rips in the TITLE: the "CR - " pattern as its own
+# token at the start or mid-title (jediking12's
+# "The Two Towers CR - 08. The Wolves").
+_SCENE_CLIP_RIP_RE = re.compile(
+    r"\bblu[- ]?ray\b|\b1080p\b|\b720p\b|\bx264\b", re.IGNORECASE)
+_SCENE_CLIP_CR_RE = re.compile(r"(?:^|\s)cr\s*-\s", re.I)
+
+
+def _is_scene_clip(candidate) -> bool:
+    """(2026-11-16) Is this candidate a fan scene-clip upload? The 16.11
+    acceptance case: the ranker crowned "The Lord of the Rings: The Two
+    Towers | Warg Attack" from "ClipZone: Heroes & Villains" (llm 0.90)
+    over the official OST tracks — the FROM_SOURCE prompt rule ("no video
+    clips") loses to a strong title match, so the signal must be
+    deterministic. Markers, all already-fetched (no new calls):
+      - the channel carries clip/scene/moment/edit/fans (the regex's own
+        boundary choices; "videos" is not a marker);
+      - the channel ends in TV (TheLotrTV — a fan "TV" station);
+      - the title carries the "CR - " Complete Recordings rip pattern;
+      - (16.11 acceptance, S10) the title carries a disc-rip marker
+        (Blu-ray/1080p/720p/x264 — "Rohirrim Charge HD (Blu-ray) 1080p":
+        officials never title uploads this way, fan scene rips always do).
+    Deliberately CONSERVATIVE — a false positive would push a legitimate
+    track below the officials, which is worse than a missed clip.
+    Officials are never clips: the guard checks _is_official_upload FIRST
+    (a channel naming itself "Official" is already official by that
+    criterion). Tolerant of shape: anything unreadable parses as not-a-clip."""
+    channel = (getattr(candidate, "channel", "") or "").strip()
+    if channel:
+        if _SCENE_CLIP_CHANNEL_RE.search(channel):
+            return True
+        if _SCENE_CLIP_TV_RE.search(channel):
+            return True
+    title = (getattr(candidate, "title", "") or "")
+    if _SCENE_CLIP_CR_RE.search(title):
+        return True
+    return bool(_SCENE_CLIP_RIP_RE.search(title))
+
+
+def _officials_clarify_question(lang=None) -> str:
+    """The honest-out user message (the fact-stop wording style). RU by
+    default; a clearly-English signals.language flips to the EN variant (the
+    same signal _factstop_reject_question picks by)."""
+    if (lang or "").strip().lower().startswith("en"):
+        return ("I could not find an official recording from this source — "
+                "the pool only has fan rips. Can you describe the scene "
+                "more precisely, or name the artist?")
+    return ("Не нашёл официальную запись из этого источника — в выдаче только "
+            "фанатские рипы. Опишешь сцену точнее или назовёшь исполнителя?")
+
+
+def _officials_only_gate(ctx: PipelineContext, out,
+                         known_artists: tuple = ()) -> "SearchOut | None":
+    """(2026-11-16, 16.11 incident, owner decision) The officials-only gate
+    at the very decide point — after the rank tail, the scene-clip demotion
+    and the fact-stop, BEFORE delivery. A plain from_source pool with ZERO
+    official-quality candidates must not reach the user as if it were an
+    answer (fan rips with film footage won the 16.11 rank): the honest
+    clarify asks for a sharper scene or the artist name, through the same
+    seam _factstop_gate returns its honest-out (reference.source preserved —
+    the anchor lives for the fragment answers that follow). Returns the
+    clarify SearchOut to stop the delivery; None = deliver `out` unchanged.
+    Skips: not from_source; the tail already asking to clarify (nothing
+    would deliver — no point replacing its question); an EMPTY pool (the
+    previous empty path owns that case, not this gate); the analog chain
+    never reaches here (it ranks in similar mode — a reference hunt where a
+    fan pool is fine). At least ONE official anywhere in the pool delivers
+    as today: the official-first ordering guards already work, and an
+    official somewhere proves the official recording WAS findable."""
+    from services.llm_search import SearchOut
+
+    if out.intent != "from_source":
+        return None                      # not this gate's scenario
+    if out.need_clarify and out.clarify_question:
+        return None                      # the tail already asks; nothing delivers
+    pool = out.candidates
+    if not pool:
+        return None                      # the previous empty path, not a clarify
+    if any(_is_official_upload(c, known_artists) for c in pool):
+        return None                      # an official exists -> deliver as today
+    _log.info("officials-only gate: 0 officials in pool of %d, honest clarify",
+              len(pool))
+    return _ensure_reference_source(ctx, SearchOut(
+        intent=out.intent, signals=out.signals, queries=out.queries,
+        assoc=out.assoc, reference=out.reference, target=out.target,
+        candidates=[], best_index=-1, confidence="low", intro=out.intro,
+        need_clarify=True,
+        clarify_question=_officials_clarify_question(
+            (out.signals or {}).get("language")),
+        trace=ctx.trace))
+
+
+# Every detected clip sinks at least this far below the WEAKEST official,
+# so no clip can outrank any official (the same 0.05 margin as the
+# official-first and scope-demote gaps in llm_search).
+_SCENE_CLIP_GAP = 0.05
+
+
+def _demote_scene_channel_clips(out, known_artists: tuple = ()) -> None:
+    """(2026-11-16, 16.11 acceptance) The deterministic
+    clip-below-officials demotion at the very tail of the plain from_source
+    flow — AFTER the officials-only gate (asleep here by construction: the
+    gate only passes pools that hold at least one official, or an
+    already-clarifying tail) and BEFORE delivery. The prompt rule ("no
+    video clips") is not trusted against a strong title match; with at
+    least one official (_is_official_upload, the same known_artists tuple
+    the gate got) AND at least one scene clip (_is_scene_clip; officials
+    themselves are never clips — officialness is decided first), every
+    clip's score becomes min(own, min(officials) - _SCENE_CLIP_GAP),
+    round 4 — below the weakest official by a fixed gap, never lower than
+    it already was — and the pool re-sorts stably by -score. best_index
+    follows the previous best's video_id; a clip best hands its slot to
+    the new leader (an official by construction: every official outscores
+    every demoted clip). ZERO officials -> nothing is demoted: that pool
+    is the officials-only gate's honest clarify, not this guard's."""
+    cands = out.candidates
+    if not cands:
+        return
+    # Officialness first (the detector's ordering rule): an official
+    # upload is never treated as a scene clip.
+    official_ids = {c.video_id for c in cands
+                    if _is_official_upload(c, known_artists)}
+    if not official_ids:
+        return
+    clip_ids = {c.video_id for c in cands
+                if c.video_id not in official_ids and _is_scene_clip(c)}
+    if not clip_ids:
+        return
+    floor = min((c.score or 0.0) for c in cands
+                if c.video_id in official_ids)
+    for c in cands:
+        if c.video_id in clip_ids:
+            c.score = round(min(c.score or 0.0, floor - _SCENE_CLIP_GAP), 4)
+    # The pre-sort best by video_id (the list is about to move; the same
+    # doctrine as _rank_and_decide and _demote_scene_clips).
+    best = cands[out.best_index] if 0 <= out.best_index < len(cands) else None
+    cands.sort(key=lambda c: -(c.score or 0.0))   # stable: ties keep order
+    if best is not None and best.video_id not in clip_ids:
+        out.best_index = next((i for i, c in enumerate(cands)
+                               if c.video_id == best.video_id), out.best_index)
+    else:
+        out.best_index = 0        # the leader; an official by construction
+    _log.info("scene-clip demotion: %d clip(s) below %d official(s)",
+              len(clip_ids), len(official_ids))
+
+
 class FromSourcePipeline(SearchPipeline):
     """Stage-3a pipeline for intent="from_source": the sonar ground plus the
     analog chain (hybrid "similar to a track from a source") over the shared
@@ -670,6 +1032,7 @@ class FromSourcePipeline(SearchPipeline):
             _MAX_QUERIES,
             _NEIGHBOR_QUERIES,
             _ref_key,
+            _title_keys,
         )
 
         # Local aliases keep the moved body textually identical to the
@@ -722,6 +1085,13 @@ class FromSourcePipeline(SearchPipeline):
         # yields a concrete track that becomes the first search phrase (then
         # the regular pipeline and rank). The FIRST miss-streak restart
         # switches to the escalated question (new information per retry). ---
+        # (2026-11-16) artists the search already knows (ground/probe/seed
+        # sonar answers): the officials-only gate treats their own channels
+        # as official - score uploads often live ONLY on the composer's
+        # channel, no Topic uploads exist at all (the LoTR case). Declared
+        # unconditionally: the gate reads it for every from_source search,
+        # sonar or not.
+        known_artists: list = []
         ground_concrete = ""  # (2026-11-14, F1) the resolved phrase, if any
         if intent == "from_source" and bothub.sonar_enabled:
             if ((ctx.restart_streak or 0) >= _ESCALATE_STREAK
@@ -732,6 +1102,8 @@ class FromSourcePipeline(SearchPipeline):
             else:
                 s_ans = await _sonar_ground_cached(ctx.store, bothub,
                                                    description, trace=trace)
+            if (s_ans.get("artist") or "").strip():
+                known_artists.append(s_ans["artist"].strip())
             if s_ans.get("track"):
                 concrete = f"{s_ans['artist'].strip()} - {s_ans['track'].strip()}"
                 queries = [q for q in queries if _ref_key(q) != _ref_key(concrete)]
@@ -788,17 +1160,81 @@ class FromSourcePipeline(SearchPipeline):
         # the analog chain never seeds (its picks are deliberately NOT the
         # soundtrack). An unsure/garbage/failed answer leaves the list as it
         # was — the seeding layer is strictly auxiliary. ---
+        seeded_count = 0
+        # (2026-11-17) fresh — the sure seeded songs — now lives at the run()
+        # scope: signals["confirmed"]["songs"] reads it below (empty list on
+        # every path that did not seed; seeding is sure-only by design, so a
+        # non-empty fresh is already certain).
+        fresh: list = []
         if (intent == "from_source" and bothub.sonar_enabled
                 and rank_intent is None and not ground_concrete):
             seeds = await _soundtrack_seed(ctx)
             seen = {(q or "").strip().lower() for q in queries}
-            fresh = []
             for s in seeds:
                 if s.lower() not in seen:
                     fresh.append(s)
                     seen.add(s.lower())
+                    if " - " in s:
+                        known_artists.append(s.split(" - ", 1)[0].strip())
             queries = (fresh + list(queries))[:_MAX_QUERIES]
+            seeded_count = len(fresh)
             _log.info("sonar-seeded queries: %d", len(fresh))
+
+        # --- unsure ground probe (16.11 incident, 2026-11-16): the ground
+        # missed and llm_search._sonar_ground dropped the unsure guess the
+        # incident needed. ONE tolerant question may put the guessed
+        # "{artist} - {track}" at the head of the ytsearch queries. The
+        # firing condition is deliberately NARROW (call economy — the probe
+        # pays a real sonar call): ground-concrete EMPTY (a hit leads
+        # already, and sure=true probe answers are not added either) AND
+        # the sure-only soundtrack seed above added nothing — the 16.11
+        # incident shape: the source WAS known (extract inferred it), both
+        # sonar answers came back unsure and BOTH were dropped, leaving
+        # only descriptive queries and a fan-rip pool. A sure seed already
+        # recovered the search, so the probe never doubles it. An
+        # analog-marked description never probes (a guessed reference
+        # track as query #1 would fight the reference ban the analog chain
+        # applies; without a ground hit the chain does not run, but the
+        # marker still says the user wants SIMILAR tracks, not the guessed
+        # one). The probe phrase is strictly a ytsearch query: no
+        # fact-cache write, no reference/ban key. ---
+        if (intent == "from_source" and bothub.sonar_enabled
+                and rank_intent is None and not ground_concrete
+                and seeded_count == 0
+                and not _ANALOG_RE.search(description or "")):
+            probe = await _unsure_ground_probe(ctx)
+            if probe:
+                queries = [q for q in queries if _ref_key(q) != _ref_key(probe)]
+                queries.insert(0, probe)
+                if " - " in probe:
+                    known_artists.append(probe.split(" - ", 1)[0].strip())
+                _log.info("unsure ground probe query: added")
+
+        # --- confirmed signals (17.11 incidents, 2026-11-17): the frozen
+        # llm_search contract — signals["confirmed"] = {"track": <"Artist -
+        # Track" the sonar ground answered SURE, or "">, "songs": [<the
+        # sure-seeded soundtrack songs, up to 3>]}. The rank-side use
+        # (protecting confirmed candidates from the false "not from the
+        # source" zeroing of incident B and the fan-over-official scoring of
+        # incident C) is llm_search's work — this file only WRITES the
+        # signal. Written BEFORE _rank_and_decide so f.signals (the same
+        # transport slot scope_artist rides) carries it into the rank input
+        # and the final SearchOut. STRICT SHAPE: empty values are written
+        # empty, never omitted. The unsure-probe phrase above never lands
+        # here — a guess is not a confirmation; only the SURE ground
+        # concrete and the analog reference are. ---
+        confirmed_track = ground_concrete
+        if (not confirmed_track and rank_intent == "similar"
+                and (f.reference.get("artist") or "").strip()
+                and (f.reference.get("track") or "").strip()):
+            # Analog fallback: the chain's resolved reference is canonical,
+            # hence a confirmation by definition (today the chain only runs
+            # on a ground hit, so ground_concrete already covers it — this
+            # guard keeps the contract true whatever wiring changes later).
+            confirmed_track = (f"{f.reference['artist'].strip()}"
+                               f" - {f.reference['track'].strip()}")
+        f.signals["confirmed"] = {"track": confirmed_track or "",
+                                  "songs": list(fresh)}
 
         # step 3: youtube
         raw = await _search_youtube(queries, on_progress=ctx.on_progress, trace=trace)
@@ -812,11 +1248,25 @@ class FromSourcePipeline(SearchPipeline):
         # steps 4-4.5: filter + enrich (excluded_titles = title-level
         # rejection, the same F2 contract similar.py applies: a restart must
         # not serve the rejected cue from another channel/upload — the w9
-        # wave2 card caught from_source silently ignoring it)
+        # wave2 card caught from_source silently ignoring it).
+        # wanted (2026-11-17, incident A): channel-independent title keys of
+        # the EXACT target — confirmed.track + the extract's target.track —
+        # so the filter's wanted-survival guarantee (legacy.py) keeps the
+        # target's copies alive at the HEAD of the top slice instead of
+        # letting 300M-view neighbors crowd them out of the ranker's sight.
+        # The analog chain passes no wanted: its confirmed track is the
+        # banned REFERENCE, and pinning reference copies to the rank-input
+        # head would only displace the neighbor candidates the chain hunts.
+        wanted = None
+        if rank_intent is None:
+            wanted = (_title_keys(confirmed_track or "")
+                      | _title_keys((f.target.get("track") or "").strip()))
+            wanted.discard("")
+            wanted = wanted or None
         filtered, enriched = await _filter_and_enrich(
             raw, ctx.excluded_ids, ctx.excluded_artists,
             metadata_svc=ctx.metadata_svc, on_progress=ctx.on_progress, trace=trace,
-            excluded_titles=ctx.excluded_titles)
+            excluded_titles=ctx.excluded_titles, wanted=wanted)
         t_filter = time.perf_counter() - t_start
 
         # steps 5+: LLM#2 rank and the decision tail. rank_intent="similar"
@@ -842,4 +1292,21 @@ class FromSourcePipeline(SearchPipeline):
             stopped = await _factstop_gate(ctx, out, enriched)
             if stopped is not None:
                 return stopped
+            # (2026-11-16, 16.11 incident) officials-only delivery gate: the
+            # LAST guard before delivery, after every other one (a fan-only
+            # pool is not an answer whatever the rank said). Deterministic —
+            # zero sonar cost; the analog chain (rank_intent="similar") never
+            # reaches it.
+            stopped = _officials_only_gate(
+                ctx, out, known_artists=tuple(known_artists))
+            if stopped is not None:
+                return stopped
+            # (2026-11-16, 16.11 acceptance) scene-clip demotion guard: the
+            # LAST word of the plain flow before delivery — with officials in
+            # the pool, every scene clip (_is_scene_clip: clip/fans channel
+            # markers, a TV channel suffix, a "CR - " rip title) sinks below
+            # the weakest official whatever the rank said. The analog chain
+            # never reaches it (the same plain-flow scope); the variant
+            # logic lives later in llm_search's choke point, untouched here.
+            _demote_scene_channel_clips(out, known_artists=tuple(known_artists))
         return out
