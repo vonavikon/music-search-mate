@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![tests](https://github.com/vonavikon/music-search-mate/actions/workflows/tests.yml/badge.svg)](https://github.com/vonavikon/music-search-mate/actions/workflows/tests.yml)
-[![VirusTotal](https://img.shields.io/badge/VirusTotal-74%2F74_clean-brightgreen)](https://www.virustotal.com/gui/file/08e22545f433afcf716c18898f9bc1462c3b58c5ea9c3885406b0465f463ffe3
+[![VirusTotal](https://img.shields.io/badge/VirusTotal-74%2F74_clean-brightgreen)](https://www.virustotal.com/gui/file/a19bf2d7bfc4b1772f99a1b74ba2bcd256a80d89d701327261f3c2600125d65a
 
 [Русский](README.ru.md) · **English** · [中文](README.zh.md) · [Español](README.es.md) · [Français](README.fr.md)
 
@@ -134,7 +134,7 @@ tests/                        612 tests, offline mocks, pytest
 
 ## Status
 
-A pet project with one maintainer. Version 1.23.0 (November 2026); the public instance runs this code.
+A pet project with one maintainer. Version 1.24.0 (November 2026); the public instance runs this code.
 
 The project grew from real usage, not a roadmap: slowed-down and sped-up upload variants were breaking tags and artwork until the candidate filter learned to drop them; group mode was rebuilt after complaints from live group chats; the local Bot API server appeared when the 50 MB cloud ceiling became the actual limit.
 
