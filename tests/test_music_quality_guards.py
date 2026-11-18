@@ -328,3 +328,41 @@ async def test_clarify_sanitizer_this_track_not_replaced(bothub_client):
 
     assert out.need_clarify
     assert out.clarify_question == _CIRCULAR_ASK
+
+
+# ════ part D: deterministic tie-break in the guard re-sorts (18.11) ════
+
+async def test_official_first_equal_demoted_scores_tiebreak(bothub_client):
+    """(2026-11-18, 18.11 acceptance) Two fan cuts of one record BOTH score
+    above the official and clamp to the SAME 0.45: the guard's re-sort
+    orders the equal-score tie by video_id, so the final order is identical
+    whichever fan YouTube listed first (Python's stable sort used to keep
+    the input order, making the pick depend on the result order)."""
+    entries = [
+        _c("fanB", "Sonny Hayes - Lose My Mind", "F4STR", 230, 900000),
+        _c("fanA", "Sonny Hayes - Lose My Mind (Fan Cut)", "F1 Edits",
+           220, 800000),
+        _c("off1", "Lose My Mind (feat. Doja Cat) (From F1® The Movie)",
+           "Don Toliver - Topic", 210, 50_000_000),
+    ]
+
+    async def _search(pool):
+        with patch.object(bothub_client, "chat_json") as mock_chat:
+            mock_chat.side_effect = [
+                _extract(intent="from_source"),
+                _rank([("fanB", 0.9), ("fanA", 0.7), ("off1", 0.5)],
+                      best_index=0),
+            ]
+            with patch("services.llm_search.search_metadata",
+                       return_value=list(pool)):
+                return await search_candidates("рок из фильма f1", bothub_client)
+
+    out_b_first = await _search(entries)                    # fanB listed first
+    out_a_first = await _search([entries[1], entries[0], entries[2]])
+
+    expected = ["off1", "fanA", "fanB"]   # official, then the tie by video_id
+    assert [c.video_id for c in out_b_first.candidates] == expected
+    assert [c.video_id for c in out_a_first.candidates] == expected
+    assert [c.score for c in out_b_first.candidates] == [0.5, 0.45, 0.45]
+    assert out_b_first.candidates[out_b_first.best_index].video_id == "off1"
+    assert out_a_first.candidates[out_a_first.best_index].video_id == "off1"

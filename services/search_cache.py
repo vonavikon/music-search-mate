@@ -54,7 +54,10 @@ log = logging.getLogger(__name__)
 
 # Bump when to_payload/from_payload or a guard changes shape/behavior: the
 # key prefix changes with it and old rows become unreachable orphans.
-SCHEMA_VERSION = 1
+# (2026-11-18) RANK_GEN: bumped whenever a wave changes ranking/delivery
+# semantics (officials-only, variants, provenance 17.11) - old cached
+# answers must die with the same deploy that ships the new behavior.
+SCHEMA_VERSION = 2
 _KEY_PREFIX = f"v{SCHEMA_VERSION}:"
 
 DEFAULT_TTL_DAYS = 30.0

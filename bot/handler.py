@@ -3465,6 +3465,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cid = await get_query_correlation(query_id)
             score_feedback(cid, action == "h", rank, cur.title)
 
+            # (2026-11-18) Miss valve: a "Не то" says the delivered reading of
+            # THIS search's description was wrong, so the extract-verdict cache
+            # row for it may be poisoned (a bad first reading pinned for 30
+            # days). Invalidate it here — the single point where a miss is
+            # registered (the button press), NOT in the restart path below
+            # (its desc carries the "Не то:" tail; the helper won't match such
+            # keys and returns False — fine). desc is the search's own text
+            # from the saved query state. The helper ships separately in
+            # services/llm_search — import lazily; ImportError is skipped
+            # silently. The valve must never break the miss chain: any error
+            # degrades to a warning.
+            if action != "h":
+                _mv_desc = (store.get("desc") or "") if store else ""
+                if _mv_desc:
+                    try:
+                        from services.llm_search import invalidate_extract_verdict
+                        _mv_ok = await invalidate_extract_verdict(_mv_desc,
+                                                                 store=store_svc)
+                        if _mv_ok:
+                            log.info("extract verdict invalidated (miss valve): %s",
+                                     _mv_ok)
+                    except ImportError:
+                        pass  # helper not merged yet — no valve until it lands
+                    except Exception:
+                        log.warning("miss valve failed q=%s", query_id,
+                                    exc_info=True)
+
         if action == "h":
             await q.message.reply_text("👍 Принято.")
             await _evict_state(context, query_id)  # track found — buttons no longer needed

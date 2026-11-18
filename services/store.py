@@ -4,10 +4,13 @@ Both a journal (observability) and a labeling dataset for rank improvement.
 Every search = a row in queries; every "hit/miss" feedback = a row in feedback.
 """
 import json
+import logging
 import re
 import time
 import aiosqlite
 from config import DB_PATH, DATA_DIR
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS queries (
@@ -429,6 +432,23 @@ async def save_fact(artist: str, track: str, lang: str, fact: str) -> None:
                  fact=excluded.fact, updated_at=excluded.updated_at""",
             (*key, fact, time.time()))
         await db.commit()
+
+
+async def delete_fact(artist: str, track: str, lang: str) -> bool:
+    """DELETE exactly one fact row; True if a row was deleted, False if there
+    was none. Key normalization = same as on read/write (case/whitespace).
+    Errors are swallowed with a warning (cache doctrine) — an eviction must
+    never raise into the caller. (2026-11-18)"""
+    key = (artist.strip().lower(), track.strip().lower(), lang)
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "DELETE FROM facts WHERE artist=? AND track=? AND lang=?", key)
+            await db.commit()
+            return bool(cur.rowcount)
+    except Exception:
+        log.warning("delete_fact failed %r", key, exc_info=True)
+        return False
 
 
 # ══════ WTP survey ══════

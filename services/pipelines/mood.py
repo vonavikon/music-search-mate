@@ -607,7 +607,7 @@ def _mix_demote(out):
     for c, is_mix in zip(out.candidates, flags):
         if is_mix:
             c.score -= _MIX_DEMOTE
-    out.candidates.sort(key=lambda c: c.score, reverse=True)
+    out.candidates.sort(key=lambda c: c.score, reverse=True)  # stable: the pop-guard order among equals survives (2026-11-18)
     if best_vid:
         new_idx = next((i for i, c in enumerate(out.candidates)
                         if c.video_id == best_vid), -1)

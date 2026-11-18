@@ -409,6 +409,11 @@ async def _rank_and_decide(ctx: PipelineContext, f: _Fields, queries: list,
             canonical_album=str(c.get("canonical_album") or ""),
             canonical_artist=_canon_art.get(c["video_id"], ""),
         ))
+    # (2026-11-18) tie-break NOT applied here on purpose: the pre-rank
+    # filter order CARRIES SEMANTICS (the mood pop-guard's LLM-source-first
+    # among equals; the wanted-head); the filter itself is deterministic
+    # given the pool SET, so a stable sort preserves both intent and
+    # pick-stability. video_id tie-breaks live in the guard re-sorts only.
     ranked.sort(key=lambda c: c.score, reverse=True)
 
     # best is the LLM's pick by video_id, not the pre-sort position.
@@ -460,7 +465,7 @@ async def _rank_and_decide(ctx: PipelineContext, f: _Fields, queries: list,
     # reaches the user.
     if rank_int == "similar" and ranked and ref_key:
         banned = sum(1 for c in ranked if _is_reference_candidate(c, ref_key))
-        ranked.sort(key=lambda c: (1 if _is_reference_candidate(c, ref_key) else 0, -c.score))
+        ranked.sort(key=lambda c: (1 if _is_reference_candidate(c, ref_key) else 0, -c.score, c.video_id))
         if 0 <= best_index < len(ranked) and _is_reference_candidate(ranked[best_index], ref_key):
             best_index = next(
                 (i for i, c in enumerate(ranked) if not _is_reference_candidate(c, ref_key)),
@@ -488,7 +493,7 @@ async def _rank_and_decide(ctx: PipelineContext, f: _Fields, queries: list,
         if clean:
             ranked.sort(key=lambda c: (
                 1 if (getattr(c, "is_noise", False) and _live_re.search(c.title or "")) else 0,
-                -c.score))
+                -c.score, c.video_id))
             if (0 <= best_index < len(ranked) and getattr(ranked[best_index], "is_noise", False)
                     and _live_re.search(ranked[best_index].title or "")):
                 best_index = next(
@@ -522,12 +527,13 @@ async def _rank_and_decide(ctx: PipelineContext, f: _Fields, queries: list,
                 boosted += 1
         if boosted:
             if ref_key:
-                ranked.sort(key=lambda c: (1 if _is_reference_candidate(c, ref_key) else 0, -c.score))
+                ranked.sort(key=lambda c: (1 if _is_reference_candidate(c, ref_key) else 0, -c.score, c.video_id))
                 best_index = next(
                     (i for i, c in enumerate(ranked) if not _is_reference_candidate(c, ref_key)),
                     best_index)
             else:
-                ranked.sort(key=lambda c: c.score, reverse=True)
+                # (2026-11-18) deterministic tie-break: equal scores order by video_id
+                ranked.sort(key=lambda c: (-c.score, c.video_id))
                 best_index = 0
             _log.info("sonic boost: +%.2f to %d candidate(s) near '%s' via getSimilar",
                       _SONIC_BOOST, boosted, sim_artist)

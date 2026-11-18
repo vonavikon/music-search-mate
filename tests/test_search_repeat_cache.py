@@ -155,13 +155,13 @@ async def test_init_sweeps_expired_rows(cache_dir):
 async def test_keys_carry_version_prefix_and_orphans_are_unreachable(cache_dir):
     k = search_cache.cache_key("query", "ru")
     assert k.startswith(f"v{search_cache.SCHEMA_VERSION}:")
-    assert k.startswith("v1:") and not k.startswith("v2:")
-    assert search_cache.SCHEMA_VERSION == 1
+    assert k.startswith("v2:") and not k.startswith("v1:")
+    assert search_cache.SCHEMA_VERSION == 2  # (2026-11-18) rank-gen bump
 
     # a row written under an OLD prefix (a pre-bump database) is orphaned:
     # every current-form key hashes differently, so the v1 lookup can
     # never match it — the row is dead weight until the TTL sweep takes it
-    old_k = "v0:" + k[len("v1:"):]
+    old_k = "v0:" + k[len("v2:"):]
     assert old_k != k
     await search_cache.init()  # create the schema before the raw insert
     async with aiosqlite.connect(_db_file(cache_dir)) as raw:

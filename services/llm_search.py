@@ -13,6 +13,7 @@ The "music-expert" persona is baked into the system prompts (CHAR_PROMPT),
 0 extra calls.
 """
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -729,6 +730,18 @@ def _canonical_variant(raw) -> str:
         return ""
     s = _VARIANT_ALIASES.get(s, s.replace("-", "_").replace(" ", "_"))
     return s if s in VARIANT_WORDS else ""
+
+
+def _text_variant(desc: str) -> str | None:
+    """(2026-11-18) Canonical variant modifier NAMED IN THE USER'S TEXT, or
+    None. The SAME detector contract as upload detection (is_variant_upload:
+    VARIANT_WORDS markers, word-boundary, case-insensitive, the context-gated
+    'live', the VARIANT_WORDS precedence — slowed wins its standard
+    '+reverb' pairing, nightcore swallows 8d), applied to the readable text
+    the user typed. Titles/names never trip it («Slowdive», «слоу данс» ->
+    None) — those boundary cases are the upload contract's own, already
+    pinned by tests/test_variant_modifiers.py."""
+    return is_variant_upload(desc, "")
 
 
 # Variant demotion gap (the choke-point variant guard): mirrors the
@@ -1998,14 +2011,19 @@ async def rerank_pool(description: str, bothub: BothubClient, pool: list,
                          (sc.get("rationale", "") if sc else ""), c.is_noise,
                          source=c.source, url=c.url, fallback_url=c.fallback_url)
         ranked.append(copy)
-    ranked.sort(key=lambda c: c.score, reverse=True)
+    # (2026-11-18) deterministic tie-break: equal scores order by video_id,
+    # the pick no longer depends on YouTube's result order
+    ranked.sort(key=lambda c: (-c.score, c.video_id))
 
     ref_key = ""
     if isinstance(reference, dict):
         ref_key = _ref_key((reference.get("artist") or "").strip())
     best_index = 0 if ranked else -1
     if ranked and ref_key:
-        ranked.sort(key=lambda c: (1 if _is_reference_candidate(c, ref_key) else 0, -c.score))
+        # (2026-11-18) deterministic tie-break: equal scores order by
+        # video_id, the pick no longer depends on YouTube's result order
+        ranked.sort(key=lambda c: (1 if _is_reference_candidate(c, ref_key) else 0,
+                                   -c.score, c.video_id))
         best_index = next((i for i, c in enumerate(ranked)
                            if not _is_reference_candidate(c, ref_key)), 0)
     for c in ranked:
@@ -2149,6 +2167,99 @@ def _matches_confirmed(title: str, keys: set) -> bool:
     return any(_same_record(toks, frozenset(k.split())) for k in keys if k)
 
 
+# --- extract-verdict cache (2026-11-18, acceptance 17.11 flake) --------------
+# The 17.11 acceptance flake: the SAME self-contained text classified
+# differently across runs («black coffee and cifgarute» -> this_track in one
+# run, mood in the next). Every guard (variant, official-first, ...) runs
+# AFTER classification and cannot cure a verdict that never happens. This
+# cache pins the FIRST successful LLM#1 reading of a fresh text: the same
+# text then deterministically reuses the same verdict (intent, target,
+# signals, queries, intro), the llm-extract call skipped. Deterministic
+# layers (source-anchor inheritance, the variant override below) re-run on
+# every call — the cache pins only the flaky LLM part. Storage: the shared
+# facts table, the same mechanism as from_source's source-fact cache
+# (_sonar_ground_cached), under the namespace ("xtract", <key>, "cls") —
+# "cls" is never a real language of a track fact (ru/en), so no collision;
+# TTL = store.FACT_TTL (30 days), applied by get_fact on read.
+_EXTRACT_CACHE_PREFIX = "xv1:"   # bump when the cached extract contract changes
+_EXTRACT_CACHE_CTX = "|ctx"      # contextual texts: never read, never written
+_XTRACT_FACT_ARTIST = "xtract"   # facts-table namespace (see above)
+_XTRACT_FACT_LANG = "cls"
+
+
+def _extract_cache_key(description: str, context=None, excluded_ids=None,
+                       excluded_artists=None, excluded_titles=None,
+                       source_anchor=None) -> str:
+    """(2026-11-18) The extract-verdict cache key: "xv1:" + sha1 of the
+    fuzzy-normalized description (the same normalization family the
+    from_source source-fact key uses — case/punctuation/whitespace fold, so
+    the same text always lands on one key). Contextual refinements (a
+    conversation context, excluded_* rejection filters, an inherited source
+    anchor) get the "|ctx" suffix: their meaning depends on the dialog
+    state, so they are NEVER cached — the suffix also makes a contextual key
+    structurally unequal to every fresh key. "" when there is no text to key
+    on (a stop-signal, not a key)."""
+    norm = fuzzy.normalize(description or "")
+    if not norm:
+        return ""
+    digest = hashlib.sha1(norm.encode("utf-8", "replace")).hexdigest()
+    contextual = bool(context or excluded_ids or excluded_artists
+                      or excluded_titles or source_anchor)
+    return (_EXTRACT_CACHE_PREFIX + digest
+            + (_EXTRACT_CACHE_CTX if contextual else ""))
+
+
+def _extract_verdict_cacheable(extract) -> bool:
+    """(2026-11-18) May this LLM#1 verdict enter (or be served from) the
+    extract cache? Only usable SEARCH answers: a parsed non-empty dict that
+    is neither a BLOCK (destructive content re-classifies fresh every time —
+    moderation must not be pinned by a first reading; a literal null-word is
+    the normal "no category" and stays cacheable) nor a CLARIFY verdict (no
+    queries and no target — the unstable garbage the clarify-early guard
+    drops anyway). Surprise extracts with legitimately empty queries ARE
+    cacheable (the pipeline builds its pool from history, not queries) —
+    everything else (this_track/similar/from_source/mood) caches as-is."""
+    if not isinstance(extract, dict) or not extract:
+        return False
+    block = (extract.get("block") or "").strip().lower()
+    if block and block not in _BLOCK_NULLWORDS:
+        return False
+    _, clarify_early, _ = _resolve_queries(extract)
+    if clarify_early:
+        from services.pipelines import _normalize_intent
+        if _normalize_intent(extract.get("intent")) != "surprise":
+            return False
+    return True
+
+
+async def invalidate_extract_verdict(desc: str, store=None) -> bool:
+    """Delete the cached extract verdict for a fresh-text desc (the 'Не то'
+    self-heal valve). Recomputes the xv1: key the same way the cache writes
+    it; contextual descs (с «Не то:»/ORIGINAL_QUERY) produce a key that was
+    never cached → no-op False. store=None/errors → False, never raises.
+    Returns True when a row was actually deleted."""
+    # (2026-11-18) The miss-handler contract: the handler calls this from its
+    # "Не то" branch so a bad pinned verdict dies with the rejection instead
+    # of serving the same wrong reading for FACT_TTL more days. The key is
+    # recomputed with the contextual parameters at their defaults (None) —
+    # exactly how the cache WRITE keyed the fresh text; a contextual desc
+    # (the handler's «Не то: ...»/ORIGINAL_QUERY rewrites) hashes to a
+    # different sha that was never written, so the delete is a harmless
+    # no-op on a non-existent row. delete_fact is the store method the other
+    # agent adds; absent (older store/stub) -> False, never an AttributeError.
+    key = _extract_cache_key(desc)
+    if not key or store is None:
+        return False
+    delete_fact = getattr(store, "delete_fact", None)
+    if not callable(delete_fact):
+        return False
+    try:
+        return bool(await delete_fact(_XTRACT_FACT_ARTIST, key,
+                                      _XTRACT_FACT_LANG))
+    except Exception:
+        return False  # auxiliary layer: a store error never breaks the miss flow
+
+
 async def search_candidates(
     description: str,
     bothub: BothubClient,
@@ -2244,12 +2355,41 @@ async def search_candidates(
     if anchor and not _INJECTION_RE.search(_fold_injection(anchor)):
         user_msg = (f"КОНТЕКСТ ИСТОЧНИКА (из предыдущих запросов диалога): {anchor}"
                     "\n\n" + user_msg)
-    # The extract call necessarily runs on the client's global model: the
-    # intent does not exist until THIS call answers it. The per-pipeline
-    # models (LLM_MODEL_PIPELINES via pipeline_model) apply from the
-    # pipeline's LLM#2 rank call onward (_rank_and_decide / rerank_pool).
-    extract = await bothub.chat_json(SYSTEM_EXTRACT, user_msg, max_tokens=1500,
-                                      trace=trace, gen_name="llm-extract")
+    # --- extract-verdict cache read (2026-11-18, acceptance 17.11 flake) ---
+    # A fresh self-contained text that was classified before reuses its
+    # pinned verdict and skips LLM#1 entirely (the flake fix: same text ->
+    # same reading). Contextual calls ("|ctx" key), store=None (legacy
+    # callers/tests) and every cache error fall through to the plain LLM#1
+    # call — auxiliary layer doctrine, the cache never breaks the search.
+    # The gates above already ran on `description`; a cached verdict only
+    # replaces the LLM call itself.
+    xv_key = _extract_cache_key(description, context, excluded_ids,
+                                excluded_artists, excluded_titles, anchor)
+    xv_hit = False
+    extract = None
+    if (xv_key and not xv_key.endswith(_EXTRACT_CACHE_CTX)
+            and store is not None):
+        try:
+            _xv_raw = await store.get_fact(_XTRACT_FACT_ARTIST, xv_key,
+                                           _XTRACT_FACT_LANG)
+            if _xv_raw:
+                _xv_loaded = json.loads(_xv_raw)
+                if (isinstance(_xv_loaded, dict) and _xv_loaded
+                        and _extract_verdict_cacheable(_xv_loaded)):
+                    extract = _xv_loaded
+                    xv_hit = True
+                    _log.info("extract verdict cache hit (xv1)")
+        except Exception:
+            # corrupt row / store error -> a plain miss, fresh classification
+            extract = None
+    if extract is None:
+        # The extract call necessarily runs on the client's global model: the
+        # intent does not exist until THIS call answers it. The per-pipeline
+        # models (LLM_MODEL_PIPELINES via pipeline_model) apply from the
+        # pipeline's LLM#2 rank call onward (_rank_and_decide / rerank_pool).
+        extract = await bothub.chat_json(SYSTEM_EXTRACT, user_msg,
+                                         max_tokens=1500,
+                                         trace=trace, gen_name="llm-extract")
     t_extract = time.perf_counter() - t_start
     # wave 45-3: per-stage timing, a neutral hook (subscriber is
     # web/metrics.py; without the web layer it is a no-op)
@@ -2261,6 +2401,23 @@ async def search_candidates(
         # The user gets something instead of silence.
         _log.warning("LLM#1 extract failed — fallback to raw search (no LLM)")
         return await _fallback_raw_search(description, on_progress, t_start, trace=trace)
+
+    # --- extract-verdict cache write (2026-11-18) ---
+    # Persist the FIRST successful reading of a fresh text so the next
+    # identical text deterministically reuses it. NOT cached: contextual
+    # calls ("|ctx"), hits (no re-save), degradations (unreachable here —
+    # the fallback above returned) and block/clarify verdicts
+    # (_extract_verdict_cacheable). A corrupt stored row is overwritten by
+    # this same write on the next miss (the cache self-heals).
+    if (store is not None and not xv_hit and xv_key
+            and not xv_key.endswith(_EXTRACT_CACHE_CTX)
+            and _extract_verdict_cacheable(extract)):
+        try:
+            await store.save_fact(
+                _XTRACT_FACT_ARTIST, xv_key, _XTRACT_FACT_LANG,
+                json.dumps(extract, ensure_ascii=False))
+        except Exception:
+            pass  # auxiliary: a failed write never breaks the search
 
     intent = extract.get("intent")
     signals = extract.get("signals") or {}
@@ -2328,6 +2485,31 @@ async def search_candidates(
                     _log.info("artist scope: target artist kept out of the "
                               "channel ban")
                     excluded_artists = _guarded or None
+
+    # --- text variant override (2026-11-18, the 17.11 flake guard) ---
+    # LLM#1 may drop or swap a variant modifier NAMED IN THE TEXT (the same
+    # classification flake the extract cache pins); the text itself is
+    # lexical evidence the model cannot misread. The pre-detector
+    # (_text_variant) runs on the READABLE user text with the SAME contract
+    # as upload detection. Override in ONE direction only: a marker found
+    # in the text WINS over the extract's variant (empty or different — the
+    # text said it); a variant the extract found with NO marker in the text
+    # is NEVER touched (the LLM may have read it from context — «замедли ту
+    # песню» names it, but a dialog-driven wish may legitimately resolve
+    # through signals). Runs AFTER the extract cache (a cached variant=None
+    # verdict gets the same override) and BEFORE the canonical-variant
+    # point below, so signals["variant"] and every downstream consumer
+    # (rank note, choke-point variant guard) see the FINAL value.
+    _tv = _text_variant(description)
+    if _tv:
+        if not isinstance(target, dict):
+            target = {}
+            extract["target"] = target
+        _tv_llm = _canonical_variant(target.get("variant"))
+        if _tv_llm != _tv:
+            _log.info("text variant override: %s -> %s (marker in the text)",
+                      _tv_llm or None, _tv)
+            target["variant"] = _tv
 
     # --- variant-modifier signal (2026-11-16, owner decision 16.11) ---
     # LLM#1's target.variant (the SYSTEM_EXTRACT ВАРИАНТ-МОДИФИКАТОР rule)
@@ -2584,9 +2766,10 @@ async def search_candidates(
                         for c in out.candidates:
                             if c.video_id not in _sc_match_ids and c.score > _sc_floor:
                                 c.score = _sc_floor
-                        # stable re-sort: matches (all > floor) lead, ties
-                        # keep the ranker's relative order
-                        out.candidates.sort(key=lambda c: -c.score)
+                        # (2026-11-18) deterministic tie-break: equal scores
+                        # order by video_id, the pick no longer depends on
+                        # YouTube's result order
+                        out.candidates.sort(key=lambda c: (-c.score, c.video_id))
                         _log.info("artist scope: demoted %d non-match(es) "
                                   "below the matches", _sc_demoted)
                 # re-point best: same video when it survived, else the top
@@ -2642,8 +2825,10 @@ async def search_candidates(
             if _of_demoted:
                 _log.info("official-first guard: demoted %d fan copie(s) "
                           "below their official upload", len(_of_demoted))
-                # stable re-sort by score: ties keep the current order
-                out.candidates.sort(key=lambda c: -c.score)
+                # (2026-11-18) deterministic tie-break: equal scores order
+                # by video_id, the pick no longer depends on YouTube's
+                # result order
+                out.candidates.sort(key=lambda c: (-c.score, c.video_id))
                 if _of_best_vid:
                     i = next((k for k, c in enumerate(out.candidates)
                               if c.video_id == _of_best_vid), None)
@@ -2757,9 +2942,11 @@ async def search_candidates(
                     _log.info("variant guard: demoted %d non-matching "
                               "candidate(s) below the requested %r upload(s)",
                               _vr_demoted, variant)
-                # stable re-sort by score: matching uploads (all above the
-                # floors) lead, ties keep the current order
-                out.candidates.sort(key=lambda c: -c.score)
+                # (2026-11-18) deterministic tie-break: matching uploads
+                # (all above the floors) lead; equal scores order by
+                # video_id, the pick no longer depends on YouTube's result
+                # order
+                out.candidates.sort(key=lambda c: (-c.score, c.video_id))
                 _vr_i = next((k for k, c in enumerate(out.candidates)
                               if c.video_id == _vr_best_vid), None)
                 out.best_index = _vr_i if _vr_i is not None else 0

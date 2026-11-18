@@ -397,7 +397,7 @@ def _demote_scene_clips(out, enriched: list) -> None:
     # The LLM's pick by video_id, not the pre-sort position (the list is
     # about to be reordered; _rank_and_decide has the same doctrine).
     best = cands[out.best_index] if 0 <= out.best_index < len(cands) else None
-    cands.sort(key=lambda c: (1 if _scene(c) else 0, -c.score))
+    cands.sort(key=lambda c: (1 if _scene(c) else 0, -c.score, c.video_id))
     if best is None or _scene(best):
         out.best_index = next((i for i, c in enumerate(cands) if not _scene(c)),
                               out.best_index)
@@ -1002,7 +1002,7 @@ def _demote_scene_channel_clips(out, known_artists: tuple = ()) -> None:
     # The pre-sort best by video_id (the list is about to move; the same
     # doctrine as _rank_and_decide and _demote_scene_clips).
     best = cands[out.best_index] if 0 <= out.best_index < len(cands) else None
-    cands.sort(key=lambda c: -(c.score or 0.0))   # stable: ties keep order
+    cands.sort(key=lambda c: (-(c.score or 0.0), c.video_id))  # (2026-11-18) deterministic tie-break
     if best is not None and best.video_id not in clip_ids:
         out.best_index = next((i for i, c in enumerate(cands)
                                if c.video_id == best.video_id), out.best_index)
